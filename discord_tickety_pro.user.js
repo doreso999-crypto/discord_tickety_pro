@@ -425,95 +425,164 @@
     }
   }
   $('#closedInbox').ontoggle=renderClosures;
-  function render() {
-    const m = route(location.pathname);
-    $('#launch').hidden = !m || standalone || isScanWorker;
-    if (!m) { $('#board').hidden = true; $('#launch').setAttribute('aria-expanded','false'); return; }
-    const [,guild,channel] = m;
-    renderScanStatus(guild);
-    $('#detach').href = '/channels/'+guild+'/'+channel+'#tickety-board';
-    const sort = $('#sort').value;
-    const all = rows(guild).sort((a,b) => sort === 'age' ? a.opened-b.opened : sort === 'latest' ? b.latest-a.latest : a.due-b.due);
-    const now = Date.now(), due = all.filter(t => stage(t,now)).length;
-    $('#launch').textContent = 'Ticket board v' + VERSION + ' · ' + all.length + (due ? ' · ' + due + ' due' : '');
-    if ($('section').hidden) return;
-    renderClosures();
-    $('#alerts').textContent = read('alerts') ? 'Disable alerts' : 'Enable alerts';
-    $('#log').textContent = read('log.'+guild) === channel ? 'Stop watching this log' : 'Watch this log';
-    $('#alerts').setAttribute('aria-pressed',String(Boolean(read('alerts'))));
-    for (const tab of $('.filters').children) {
-      tab.setAttribute('aria-pressed',String(tab.dataset.filter === filter));
-      tab.lastChild.textContent = all.filter(t => matchesFilter(t,tab.dataset.filter,now)).length;
+  function updateOwnerOptions(all){
+    const el=$('#ownerFilter'),v=el.value,names=[...new Set(all.map(t=>t.user))]
+      .sort((a,b)=>a.localeCompare(b,undefined,{sensitivity:'base'}));
+    if(JSON.stringify(names)!==JSON.stringify([...el.options].slice(1).map(o=>o.value))){
+      el.replaceChildren();
+      const any=element('option','All users');any.value='';el.append(any);
+      for(const name of names){const option=element('option',name);option.value=name;el.append(option);}
     }
-    const q = $('#search').value.trim().toLowerCase();
-    const shown = all.filter(t => (t.owner+' '+t.name+' '+t.id).toLowerCase().includes(q) &&
-      matchesFilter(t,filter,now));
-    const view = JSON.stringify([guild,new Date(now).toDateString(),shown,shown.map(t=>stage(t,now)),filter,q]);
-    if (view === lastView) return;
-    lastView = view;
-    const list = $('#list');
-    const scrollTop = list.scrollTop;
-    list.replaceChildren();
-    const groups = new Map();
-    for (const t of shown) {
-      const k = t.owner.toLowerCase();
-      if (!groups.has(k)) groups.set(k,[]);
-      groups.get(k).push(t);
-    }
-    if (!shown.length) {
-      const empty = element('small',all.length ? 'No tickets match this view.' : 'Open a Tickety ticket, or select Watch this log in your ticket log channel.');
-      empty.className='empty'; list.append(empty);
-    }
-    for (const key of [...groups.keys()].sort((a,b)=>a.localeCompare(b))) {
-      const tickets = groups.get(key), group = document.createElement('details');
-      const groupKey = guild + '/' + key;
-      group.open = expanded.get(groupKey) ?? (groups.size===1 || Boolean(q));
-      group.ontoggle = ()=>{if(group.isConnected) expanded.set(groupKey,group.open);};
-      const summary = element('summary','');
-      const user = element('span',tickets[0].owner || 'Unknown opener'); user.className='user';
-      const count = element('span',tickets.length === 1 ? '1 ticket' : tickets.length+' tickets'); count.className='meta';
-      const urgent = tickets.filter(t=>stage(t,now)).length;
-      if (urgent) { const flag=element('small',urgent+' due'); flag.className='alert'; summary.append(user,flag,count); }
-      else summary.append(user,count);
-      group.append(summary);
-      for (const t of tickets) {
-        const card = document.createElement('article'), link = element('a',t.name);
-        link.href = '/channels/'+guild+'/'+t.id;
-        const warning = stage(t,now);
-        const date = element('small',('Estimated expiry') + ' · ' + new Date(t.due).toLocaleString() + (warning?' · '+warning:''));
-        if (warning) date.className='alert';
-        link.target='_blank'; link.rel='noopener';
-        const key = historyKey(guild,t.id);
-        const history = element('details',''); history.className='history'; history.id=key;
-        history.open=openedHistory.has(key);
-        history.append(element('summary','Messages'),element('div',''));
-        history.ontoggle=()=>{if (!history.isConnected) return; if(history.open){openedHistory.add(key);refreshHistory(key);} else openedHistory.delete(key);};
-        const age = ageDays(t.opened,now);
-        const activity = element('small','Age · '+age+(age===1?' day':' days')+'   |   Last activity · '+new Date(t.latest).toLocaleString());
-        activity.title='Opened '+new Date(t.opened).toLocaleString();
-        card.append(link,activity,date);
-        if(t.signal) {
-          const evidence = element('small','Likely complete · '+t.signal.author+' · “'+t.signal.text.slice(0,160)+'”');
-          evidence.className='evidence';card.append(evidence);
-        }
-        card.append(history); group.append(card);
-      }
-      list.append(group);
-    }
-    list.scrollTop = scrollTop;
+    el.value=names.includes(v)?v:'';
   }
-  function reminders() {
-    if (!read('alerts')) return;
-    const pending = [];
-    for (const key of Object.keys(localStorage).filter(k=>k.startsWith(PREFIX+'ticket.'))) {
-      const t = inspectTicket(JSON.parse(localStorage.getItem(key))), label = stage(t,Date.now());
-      if (label && t.notified !== t.due+'|'+label) pending.push({t,label});
+  function matchSearch(t,query){
+    const haystack=normalize([t.name,t.user,t.ownerAlias,t.id,t.type,t.last?.author].join(' '));
+    return !query||query.split(/\s+/).every(word=>haystack.includes(word));
+  }
+  function ticketCard(t,guild,now){
+    const card=document.createElement('article');card.className='ticket-card';
+    const title=document.createElement('div');title.className='ticket-title';
+    const link=element('a',t.name);
+    link.href='/channels/'+guild+'/'+t.id;link.target='_blank';link.rel='noopener';
+    const category=element('span',t.type);category.className='ticket-tag';
+    const status=element('span',t.status==='Resolved'?'Closed locally':
+      t.complete?'Likely complete':stage(t,now)?'Follow-up due':'Active');
+    status.className='ticket-tag'+(t.complete?' done':stage(t,now)?' overdue':'');
+    title.append(link,category,status);
+    const meta=document.createElement('div');meta.className='ticket-meta';
+    meta.append(element('span','User: '+t.user),element('span','Created: '+new Date(t.opened).toLocaleDateString()),
+      element('span','Last reply: '+(t.latest?new Date(t.latest).toLocaleString():'Not collected')));
+    const action=document.createElement('div');action.className='ticket-action';
+    const note=element('span','');note.className='ticket-note';
+    if(t.status==='Resolved')note.textContent='Marked closed locally · no follow-up due.';
+    else if(t.complete)note.textContent='Reminder: close the task. Last reply: '+String(t.last?.text||'').slice(0,120);
+    else if(stage(t,now)){
+      note.className+=' overdue';
+      note.textContent='Follow-up due · 5 days since last message ('+new Date(t.latest).toLocaleString()+')';
+    } else if(t.latest)note.textContent='Follow-up begins 5 days after the latest message.';
+    else note.textContent='Latest message not yet collected. Scan this thread.';
+    action.append(note);
+    if(t.complete||t.status==='Resolved'){
+      const btn=button(t.status==='Resolved'?'Reopen (local)':'Mark task closed (local)',()=>{
+        save(guild,t.id,{status:t.status==='Resolved'?'Open':'Resolved',notified:''});
+        lastView='';render();
+      });
+      btn.title='This updates the local tracker, not Discord or Asana.';
+      action.append(btn);
     }
-    if (!pending.length) return;
-    const first=pending[0].t;
-    GM_notification({title:'Tickety follow-up · '+pending.length+' ticket(s)',text:pending.slice(0,3).map(({t,label})=>(t.owner||'Unknown opener')+' · '+t.name+' · '+label).join('\n'),
-      onclick:()=>window.open('https://discord.com/channels/'+first.guild+'/'+first.id,'_blank','noopener')});
-    pending.forEach(({t,label})=>save(t.guild,t.id,{notified:t.due+'|'+label}));
+    const key=historyKey(guild,t.id),history=document.createElement('details');
+    history.className='history';history.id=key;
+    history.open=openedHistory.has(key);
+    history.append(element('summary','Saved messages'),document.createElement('div'));
+    history.ontoggle=()=>{
+      if(!history.isConnected)return;
+      if(history.open){openedHistory.add(key);refreshHistory(key);}
+      else openedHistory.delete(key);
+    };
+    card.append(title,meta,action,history);
+    return card;
+  }
+  function render(){
+    const m=route(location.pathname);
+    $('#launch').hidden=!m||standalone||isScanWorker;
+    if(!m){$('#board').hidden=true;$('#launch').setAttribute('aria-expanded','false');return;}
+    const [,guild,channel]=m;
+    renderScanStatus(guild);
+    $('#detach').href='/channels/'+guild+'/'+channel+'#tickety-board';
+    const all=rows(guild),now=Date.now();
+    const overdue=all.filter(t=>stage(t,now)).length;
+    const closing=all.filter(t=>t.complete&&t.status!=='Resolved').length;
+    $('#launch').textContent='Ticket board v'+VERSION+' · '+all.length+
+      (overdue?' · '+overdue+' due':'')+(closing?' · '+closing+' close task':'');
+    if($('#board').hidden)return;
+    renderClosures();
+    $('#alerts').textContent=read('alerts')?'Disable alerts':'Enable alerts';
+    $('#alerts').setAttribute('aria-pressed',String(Boolean(read('alerts'))));
+    $('#log').textContent=read('log.'+guild)===channel?'Stop watching this log':'Watch this log';
+    updateOwnerOptions(all);
+    const sort=$('#sort').value,groupBy=$('#groupBy').value,
+      owner=$('#ownerFilter').value,type=$('#typeFilter').value,
+      field=$('#dateField').value,from=$('#fromDate').value,to=$('#toDate').value,
+      query=normalize($('#search').value);
+    const inScope=t=>{
+      if(owner&&t.user!==owner)return false;
+      if(type&&t.type!==type)return false;
+      if(!matchSearch(t,query))return false;
+      const date=localDateKey(field==='latest'?t.latest:t.opened);
+      if(from&&(!date||date<from))return false;
+      if(to&&(!date||date>to))return false;
+      return true;
+    };
+    for(const tab of $('.filters').children){
+      tab.setAttribute('aria-pressed',String(tab.dataset.filter===filter));
+      tab.lastChild.textContent=all.filter(t=>inScope(t)&&matchesFilter(t,tab.dataset.filter,now)).length;
+    }
+    const shown=all.filter(t=>inScope(t)&&matchesFilter(t,filter,now))
+      .sort((a,b)=>compareTickets(a,b,sort,now));
+    $('#resultCount').textContent=shown.length+' of '+all.length+' tickets'+
+      (query?' · Search: '+$('#search').value.trim():'')+(owner?' · User: '+owner:'')+(type?' · '+type:'');
+    const signature=JSON.stringify([guild,shown,filter,sort,groupBy,owner,type,field,from,to,query,
+      shown.map(t=>stage(t,now))]);
+    if(signature===lastView)return;
+    lastView=signature;
+    const list=$('#list'),previousScroll=list.scrollTop;list.replaceChildren();
+    if(!shown.length){
+      const empty=element('small',all.length?'No matches. Try a different name, date range or Clear filters.':
+        'No verified tickets collected. Scan all or open a Tickety ticket.');
+      empty.className='empty';list.append(empty);
+    }else if(groupBy==='flat'){
+      const flat=document.createElement('div');flat.className='flat-view';
+      for(const t of shown)flat.append(ticketCard(t,guild,now));
+      list.append(flat);
+    }else{
+      const groups=new Map();
+      for(const t of shown){
+        const label=groupBy==='type'?t.type:t.user;
+        if(!groups.has(label))groups.set(label,[]);
+        groups.get(label).push(t);
+      }
+      // Sort groups by their leading ticket, not forcibly by alphabet.
+      const entries=[...groups.entries()].sort((a,b)=>
+        sort==='user'&&groupBy==='owner'?a[0].localeCompare(b[0],undefined,{sensitivity:'base'}):
+        sort==='type'&&groupBy==='type'?TYPE_OPTIONS.indexOf(a[0])-TYPE_OPTIONS.indexOf(b[0]):
+        compareTickets(a[1][0],b[1][0],sort,now));
+      for(const [label,tickets] of entries){
+        const group=document.createElement('details');group.className='ticket-group';
+        const gKey=guild+'/'+groupBy+'/'+label;
+        group.open=query?true:(expanded.get(gKey)??(groups.size<=4));
+        group.ontoggle=()=>{if(group.isConnected&&!query)expanded.set(gKey,group.open);};
+        const header=document.createElement('summary');
+        const who=element('span',label);who.className='user';
+        header.append(who,element('span',tickets.length+' ticket'+(tickets.length===1?'':'s')));
+        const due=tickets.filter(t=>stage(t,now)).length;
+        const close=tickets.filter(t=>t.complete&&t.status!=='Resolved').length;
+        if(due){const n=element('small',due+' due');n.className='alert';header.append(n);}
+        if(close){const n=element('small',close+' close task');n.className='evidence';header.append(n);}
+        group.append(header);
+        for(const t of tickets)group.append(ticketCard(t,guild,now));
+        list.append(group);
+      }
+    }
+    list.scrollTop=previousScroll;
+  }
+  function reminders(){
+    if(!read('alerts'))return;
+    const pending=[],now=Date.now();
+    for(const key of Object.keys(localStorage).filter(k=>k.startsWith(PREFIX+'ticket.'))){
+      const t=inspectTicket(JSON.parse(localStorage.getItem(key)));
+      const closing=t.complete&&t.status!=='Resolved',due=stage(t,now)==='Follow-up due';
+      if(!closing&&!due)continue;
+      const kind=closing?'Close task':'5-day follow-up';
+      const code=(closing?'close:':'followup:')+String(t.last?.id||t.latest||t.id);
+      if(t.notified===code)continue;
+      pending.push({t,kind,code});
+    }
+    if(!pending.length)return;
+    const t=pending[0].t;
+    GM_notification({title:'Tickety · '+pending.length+' reminder'+(pending.length===1?'':'s'),
+      text:pending.slice(0,3).map(x=>x.kind+' · '+x.t.user+' · '+x.t.name).join('\n'),
+      onclick:()=>window.open('https://discord.com/channels/'+t.guild+'/'+t.id,'_blank','noopener')});
+    for(const x of pending)save(x.t.guild,x.t.id,{notified:x.code});
   }
 
   // Browser-session scan: a single background Tampermonkey tab visits the

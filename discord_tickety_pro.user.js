@@ -985,10 +985,18 @@
       e.stopPropagation(); setBoard(false);
     }
   });
-  $('#search').oninput=render; $('#sort').onchange=render;
+  $('#search').oninput=()=>{lastView='';render();};
+  for(const id of ['sort','groupBy','ownerFilter','typeFilter','dateField','fromDate','toDate']){
+    $('#'+id).addEventListener('change',()=>{lastView='';render();});
+  }
+  $('#clearFilters').onclick=()=>{
+    $('#search').value='';$('#sort').value='new';$('#groupBy').value='owner';
+    $('#ownerFilter').value='';$('#typeFilter').value='';$('#dateField').value='opened';
+    $('#fromDate').value='';$('#toDate').value='';filter='All';lastView='';render();
+  };
   $('#alerts').onclick=()=>{
     const enabled=!read('alerts');write('alerts',enabled); render();
-    msg(enabled?'Reply alerts enabled for open ticket tabs. Deadline alerts run at 24 hours, 6 hours and past due.':'Desktop alerts disabled.');
+    msg(enabled?'Reply alerts enabled. Follow-ups trigger after 5 days without a message; completed tickets receive close-task reminders.':'Desktop alerts disabled.');
     if(enabled) checkReminders();
   };
   $('#log').onclick=()=>{
@@ -1002,7 +1010,16 @@
     if(navigator.locks) navigator.locks.request(PREFIX+'notify',{ifAvailable:true},lock=>{if(lock)reminders();});
     else reminders();
   }
-  window.addEventListener('storage',e=>{if(e.key?.startsWith(PREFIX)){if(e.key.startsWith(PREFIX+'messages.')) {summaries.delete(e.key.slice(PREFIX.length));refreshHistory(e.key.slice(PREFIX.length));render();return;} if(e.key.startsWith(PREFIX+'log.'))seen=new WeakMap();render();}});
+  window.addEventListener('storage',e=>{
+    if(!e.key?.startsWith(PREFIX))return;
+    if(e.key.startsWith(PREFIX+'messages.')){
+      const k=e.key.slice(PREFIX.length);
+      summaries.delete(k);lastView='';refreshHistory(k);render();return;
+    }
+    if(e.key.startsWith(PREFIX+'ticket.')){summaries.clear();lastView='';}
+    if(e.key.startsWith(PREFIX+'log.'))seen=new WeakMap();
+    render();
+  });
   window.addEventListener('focus',()=>{tick();checkReminders();});
   window.addEventListener('online',()=>{tick();if(isScanWorker)runScanWorker();});
   setInterval(tick,4000);setInterval(checkReminders,60000);

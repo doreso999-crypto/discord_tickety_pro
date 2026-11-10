@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         Discord Tickety Pro
 // @namespace    doreso999-crypto/discord_tickety_pro
-// @version      1.3.0
+// @version      1.3.1
 // @description  Group visible Tickety tickets by opener and remind staff to follow up.
 // @match        https://discord.com/*
 // @run-at       document-idle
@@ -122,6 +122,7 @@
       <div class="bar"><input id="search" type="search" aria-label="Search opener or ticket" placeholder="Search opener or ticket"><select id="sort" aria-label="Sort tickets within each opener"><option value="due">Expiring first</option><option value="age">Oldest ticket first</option><option value="latest">Latest activity first</option></select></div>
       <div class="filters" role="group" aria-label="Filter tickets"></div>
       <small class="viewer-help">Open a ticket to collect its visible messages. Keep it open in a separate tab for reply alerts while you work elsewhere.</small>
+      <details id="closedInbox"><summary>Closure notices</summary><div id="receipts" style="max-height:34vh;overflow:auto;padding:0 14px"></div></details>
       <small role="status" id="msg"></small><div id="list"></div>
       <footer><button id="log">Watch this log</button><button id="alerts">Enable alerts</button></footer>
     </section>`;
@@ -274,6 +275,53 @@
     const count = element('span',''); count.className='count'; tab.append(count);
     $('.filters').append(tab);
   }
+  function catchClosures() {
+    const dm = /^\/channels\/@me\/(\d+)(?:\/|$)/.exec(location.pathname);
+    if (!dm || !document.querySelector('[data-list-id="chat-messages"][aria-label="Messages in Tickety"], main[aria-label="Tickety (Direct Message)" i], [aria-label^="Tickety (direct message)" i][href="/channels/@me/'+dm[1]+'"]')) return;
+    for(const embed of document.querySelectorAll('[id^="message-accessories-"] article')) {
+      if(embed.querySelector('[class*="embedTitle"]')?.textContent.trim() !== 'Ticket Closed' ||
+         !embed.querySelector('[class*="embedFooterText"]')?.textContent.includes('Tickety.top')) continue;
+      const row = embed.closest('li[id]');
+      const match = row?.id.match(/^chat-messages-(\d+)-(\d+)$/);
+      if(!match || match[1]!==dm[1]) continue;
+      const desc = embed.querySelector('[class*="embedDescription"]');
+      if(!desc) continue;
+      const fields = {};
+      for(const strong of desc.querySelectorAll('li strong')) {
+        const label = strong.textContent.trim();
+        fields[label]=strong.parentElement.textContent.slice(strong.textContent.length).replace(/^\s*:\s*/,'').trim();
+      }
+      const server=desc.querySelector('strong')?.textContent.trim();
+      if(!server || !fields['Ticket Name']) continue;
+      const key='closure.'+dm[1]+'.'+match[2];
+      const notice={server,fields,dm:dm[1],id:match[2]};
+      if(JSON.stringify(notice)!==JSON.stringify(read(key))) write(key,notice);
+    }
+  }
+  let receiptView='';
+  function renderClosures() {
+    const keys=Object.keys(localStorage).filter(k=>k.startsWith(PREFIX+'closure.'));
+    const inbox=$('#closedInbox');
+    inbox.querySelector('summary').textContent='Closure notices · '+keys.length;
+    if(!inbox.open) return;
+    const q=$('#search').value.trim().toLowerCase();
+    const notices=keys.map(k=>JSON.parse(localStorage.getItem(k))).filter(n=>
+      [n.server,...Object.values(n.fields)].join(' ').toLowerCase().includes(q))
+      .sort((a,b)=>created(b.id)-created(a.id));
+    const view=JSON.stringify(notices);
+    if(view===receiptView)return;
+    receiptView=view;
+    const box=$('#receipts');box.replaceChildren();
+    if(!notices.length)box.append(element('small',keys.length?'No matching notices.':'Open your Tickety DM to collect visible closure notices.'));
+    for(const n of notices) {
+      const f=n.fields,card=element('article',''),link=element('a',f['Ticket Name']);
+      link.href='/channels/@me/'+n.dm+'/'+n.id;link.target='_blank';link.rel='noopener';
+      card.append(link,element('small',[n.server,f['Panel Name'],f['Close Date']].filter(Boolean).join(' · ')),
+        element('small',[f['Closed By'],f['Close Reason']].filter(Boolean).join(' · ')));
+      box.append(card);
+    }
+  }
+  $('#closedInbox').ontoggle=renderClosures;
   function render() {
     const m = route(location.pathname);
     $('#launch').hidden = !m || standalone;
@@ -285,6 +333,7 @@
     const now = Date.now(), due = all.filter(t => stage(t,now)).length;
     $('#launch').textContent = 'Ticket board · ' + all.length + (due ? ' · ' + due + ' due' : '');
     if ($('section').hidden) return;
+    renderClosures();
     $('#alerts').textContent = read('alerts') ? 'Disable alerts' : 'Enable alerts';
     $('#log').textContent = read('log.'+guild) === channel ? 'Stop watching this log' : 'Watch this log';
     $('#alerts').setAttribute('aria-pressed',String(Boolean(read('alerts'))));
@@ -363,6 +412,7 @@
     pending.forEach(({t,label})=>save(t.guild,t.id,{notified:t.due+'|'+label}));
   }
   function tick() {
+    catchClosures();
     const m = route(location.pathname);
     if (m) {
       if(context!==m[0]) { context=m[0]; seen=new WeakMap(); watchSince.clear(); msg(''); }

@@ -1,11 +1,13 @@
 // ==UserScript==
 // @name         Discord Tickety Pro
 // @namespace    doreso999-crypto/discord_tickety_pro
-// @version      1.3.1
-// @description  Group visible Tickety tickets by opener and remind staff to follow up.
+// @version      1.4.0
+// @description  Group Tickety tickets, scan sidebar threads once per session, and remind staff to follow up.
 // @match        https://discord.com/*
 // @run-at       document-idle
 // @grant        GM_notification
+// @grant        GM_openInTab
+// @grant        GM_closeTab
 // ==/UserScript==
 
 (() => {
@@ -19,6 +21,12 @@
   const created = id => Number(BigInt(id) >> 22n) + 1420070400000;
   
   const standalone = location.hash === '#tickety-board';
+  const SCAN_HASH = '#tickety-scan=';
+  const scanToken = location.hash.startsWith(SCAN_HASH)
+    ? location.hash.slice(SCAN_HASH.length)
+    : sessionStorage.getItem(PREFIX + 'scanner.worker');
+  const isScanWorker = Boolean(scanToken) && !standalone;
+  if (location.hash.startsWith(SCAN_HASH)) sessionStorage.setItem(PREFIX + 'scanner.worker', scanToken);
   const summaries = new Map();
   function isCompletion(text) {
     const sentence = text.toLowerCase().replace(/<@!?\d+>/g,'').trim();
@@ -110,6 +118,9 @@
       .viewer-help{padding:8px 18px}.history{white-space:pre-wrap;overflow-wrap:anywhere}.history p{margin:6px 0 12px}.history summary{font-size:12px}
       #launch{background:#ffd343;color:#201903;border:2px solid #33290b;border-radius:22px;padding:9px 15px;touch-action:none;user-select:none;cursor:grab}
       #launch:active{cursor:grabbing}#board{border-top:4px solid #ffd343;background:#152029}
+      #scanStatus{display:block;padding:7px 18px 9px;border-bottom:1px solid #383d4d;color:#d2dae3}
+      #scanStatus:empty{display:none}
+      footer button:disabled{opacity:.42;cursor:not-allowed}
       #detach,article>a{color:#a5e9f3;font-weight:650;text-underline-offset:3px}
       #detach{font-size:13px}summary{background:#24343d}.filters button[aria-pressed=true]{background:#ffda62;color:#211b0b;border-color:#ffda62}.filters button[aria-pressed=true] .count{color:#433514}
       .evidence{color:#9be2bb;padding:4px 0}.history>div{padding:0 12px}
@@ -121,10 +132,11 @@
       <header><h2>Ticket board</h2><a id="detach" target="_blank" rel="noopener">Open in tab ↗</a><button id="close" aria-label="Close ticket board">×</button></header>
       <div class="bar"><input id="search" type="search" aria-label="Search opener or ticket" placeholder="Search opener or ticket"><select id="sort" aria-label="Sort tickets within each opener"><option value="due">Expiring first</option><option value="age">Oldest ticket first</option><option value="latest">Latest activity first</option></select></div>
       <div class="filters" role="group" aria-label="Filter tickets"></div>
-      <small class="viewer-help">Open a ticket to collect its visible messages. Keep it open in a separate tab for reply alerts while you work elsewhere.</small>
+      <small class="viewer-help">Session scanner checks visible sidebar threads in one background tab. Only Tickety-confirmed tickets appear below. Scanning may mark threads as read.</small>
+      <small role="status" id="scanStatus" aria-live="polite"></small>
       <details id="closedInbox"><summary>Closure notices</summary><div id="receipts" style="max-height:34vh;overflow:auto;padding:0 14px"></div></details>
       <small role="status" id="msg"></small><div id="list"></div>
-      <footer><button id="log">Watch this log</button><button id="alerts">Enable alerts</button></footer>
+      <footer><button id="scanNow">Scan all now</button><button id="scanToggle">Pause scan</button><button id="log">Watch this log</button><button id="alerts">Enable alerts</button></footer>
     </section>`;
   const $ = s => root.querySelector(s);
   const msg = s => { $('#msg').textContent = s; };
@@ -324,9 +336,10 @@
   $('#closedInbox').ontoggle=renderClosures;
   function render() {
     const m = route(location.pathname);
-    $('#launch').hidden = !m || standalone;
+    $('#launch').hidden = !m || standalone || isScanWorker;
     if (!m) { $('#board').hidden = true; $('#launch').setAttribute('aria-expanded','false'); return; }
     const [,guild,channel] = m;
+    renderScanStatus(guild);
     $('#detach').href = '/channels/'+guild+'/'+channel+'#tickety-board';
     const sort = $('#sort').value;
     const all = rows(guild).sort((a,b) => sort === 'age' ? a.opened-b.opened : sort === 'latest' ? b.latest-a.latest : a.due-b.due);
@@ -411,6 +424,243 @@
       onclick:()=>window.open('https://discord.com/channels/'+first.guild+'/'+first.id,'_blank','noopener')});
     pending.forEach(({t,label})=>save(t.guild,t.id,{notified:t.due+'|'+label}));
   }
+
+  // Browser-session scan: a single background Tampermonkey tab visits the
+  // thread entries rendered in the current server's sidebar. It never uses
+  // a Discord user token, private endpoints, or bulk network requests.
+  const SCAN_IDLE_MS = 30 * 60 * 1000;
+  const SCAN_STALE_MS = 2 * 60 * 1000;
+  const SCAN_LOAD_MS = 16000;
+  const scanJobKey = guild => 'scanner.job.' + guild;
+  const delay = ms => new Promise(resolve => setTimeout(resolve, ms));
+  const scanId = () => Date.now().toString(36) + '-' + Math.random().toString(36).slice(2, 10);
+
+  function discoverThreads() {
+    const found = new Map();
+    for (const item of document.querySelectorAll('[data-list-item-id^="channels___"][aria-label*="(thread)"]')) {
+      const id = item.getAttribute('data-list-item-id')?.match(/^channels___(\d{15,20})$/)?.[1];
+      if (!id) continue;
+      const name = item.querySelector('[class*="name_"] [aria-hidden="true"]')?.textContent.trim()
+        || item.querySelector('[class*="name_"]')?.textContent.trim()
+        || item.getAttribute('aria-label')?.replace(/^(?:\d+ mentions?,\s*)/i,'').replace(/\s*\(thread\).*$/i,'').trim()
+        || 'Ticket ' + id;
+      found.set(id, {id,name});
+    }
+    const m = route(location.pathname);
+    if (m) {
+      const main = [...document.querySelectorAll('main[aria-label]')]
+        .find(el => threadTitle(el) && el.querySelector('[id^="chat-messages-' + m[2] + '-"]'));
+      if (main && !found.has(m[2])) found.set(m[2], {id:m[2],name:threadTitle(main)});
+    }
+    return [...found.values()];
+  }
+
+  // A resumed browser tab may restore sessionStorage. A shared, recently
+  // active localStorage marker is more useful for detecting a fresh session.
+  function browserSession() {
+    const now = Date.now();
+    let session = read('scanner.session');
+    if (!session || !session.id || now - session.seen > SCAN_IDLE_MS || session.seen > now + 60000) {
+      session = {id:scanId(),seen:now};
+      write('scanner.session',session);
+    } else if (now - session.seen > 55000) {
+      session.seen=now;
+      write('scanner.session',session);
+    }
+    return session.id;
+  }
+
+  function makeScanJob(guild,session,queue) {
+    return {guild,session,id:scanId(),queue,index:0,results:{},status:'ready',
+      heartbeat:0,started:Date.now(),updated:Date.now(),error:''};
+  }
+
+  function mergeDiscovered(job,threads) {
+    const known = new Set(job.queue.map(t=>t.id));
+    let added=0;
+    for (const thread of threads) if (!known.has(thread.id)) {
+      job.queue.push(thread); known.add(thread.id); added++;
+    }
+    if (added && job.status==='complete') job.status='ready';
+    return added;
+  }
+
+  function launchScan(guild,userGesture=false) {
+    const key=scanJobKey(guild);
+    let job=read(key);
+    if (!job || !job.queue.length || job.index>=job.queue.length || !navigator.onLine) return false;
+    if (job.status==='paused') return false;
+    if (job.status==='running' && Date.now()-job.heartbeat < SCAN_STALE_MS) return true;
+    job={...job,status:'running',heartbeat:Date.now(),updated:Date.now(),error:''};
+    write(key,job);
+    const target=location.origin+'/channels/'+guild+'/'+job.queue[job.index].id+SCAN_HASH+job.id;
+    try {
+      if (typeof GM_openInTab==='function') {
+        const tab=GM_openInTab(target,{active:false,insert:true,setParent:true});
+        if (tab) return true;
+      }
+      if (userGesture && window.open(target,'_blank')) return true;
+      throw new Error('Background tab unavailable. Allow Tampermonkey to open tabs and press Resume scan.');
+    } catch (error) {
+      job={...job,status:'ready',error:error.message || 'Scanner tab could not open.'};
+      write(key,job);
+      return false;
+    }
+  }
+
+  function maybeStartSessionScan(guild) {
+    if (isScanWorker || !navigator.onLine || document.visibilityState!=='visible') return;
+    const discovered=discoverThreads();
+    if (!discovered.length) return;
+    const session=browserSession();
+    const key=scanJobKey(guild);
+    let job=read(key);
+    if (!job || job.session!==session) {
+      job=makeScanJob(guild,session,discovered);
+      write(key,job);
+      launchScan(guild);
+      return;
+    }
+    const added=mergeDiscovered(job,discovered);
+    if (added) {
+      job.updated=Date.now();
+      write(key,job);
+      if (job.status==='ready' && !job.error) launchScan(guild);
+    }
+    if (job.status==='running' && Date.now()-job.heartbeat > SCAN_STALE_MS) {
+      job.status='interrupted';
+      job.error='Scanning tab stopped responding. Press Resume scan.';
+      write(key,job);
+    }
+  }
+
+  function renderScanStatus(guild) {
+    const job=read(scanJobKey(guild));
+    const status=$('#scanStatus'), action=$('#scanToggle'), now=$('#scanNow');
+    const total=job?.queue.length || 0;
+    const complete=Math.min(total,job?.index || 0);
+    const uncertain=Object.values(job?.results || {}).filter(v=>v!=='collected').length;
+    const state=job?.status || 'waiting';
+    const caption={ready:'Ready',running:'Scanning',paused:'Paused',complete:'Finished',
+      interrupted:'Interrupted',waiting:'Waiting for threads'}[state] || state;
+    status.textContent='Session scan: '+caption+' · '+complete+'/'+total+' threads'
+      +(uncertain ? ' · '+uncertain+' unverified' : '')
+      +(job?.error ? ' · '+job.error : '')
+      +(total ? ' · only verified Tickety tickets are listed' : '');
+    action.textContent=state==='running' ? 'Pause scan' : 'Resume scan';
+    action.disabled=!job || state==='complete' || (state==='waiting') || !total;
+    now.disabled=state==='running';
+    return job;
+  }
+
+  function closeWorker() {
+    sessionStorage.removeItem(PREFIX+'scanner.worker');
+    try { if (typeof GM_closeTab==='function') {GM_closeTab(); return;} } catch {}
+    window.close();
+  }
+
+  async function waitForThread(id) {
+    const until=Date.now()+SCAN_LOAD_MS;
+    while (Date.now()<until) {
+      const main=[...document.querySelectorAll('main[aria-label]')].find(node=>
+        threadTitle(node) && node.querySelector('li[id^="chat-messages-' + id + '-"]'));
+      if (main) return main;
+      await delay(450);
+    }
+    return null;
+  }
+
+  async function visitThread(guild,item) {
+    const main=await waitForThread(item.id);
+    if (!main) return 'unverified';
+    const scroller=main.querySelector('[class*="scroller_"][role="group"]');
+    const until=Date.now()+9000;
+    // Visit the beginning to find Tickety's creator embed, including when
+    // Discord initially displays only the newest part of a long thread.
+    do {
+      scan(guild,item.id);
+      captureReplies(guild,item.id);
+      if (read(keyFor(guild,item.id))?.owner) break;
+      if (scroller) scroller.scrollTop=0;
+      await delay(550);
+    } while (Date.now()<until && navigator.onLine);
+    // Return to recent messages to collect the latest available replies.
+    if (scroller) {
+      scroller.scrollTop=scroller.scrollHeight;
+      await delay(650);
+    }
+    scan(guild,item.id);
+    captureReplies(guild,item.id);
+    await delay(350); // permit queued navigator.locks writes to finish
+    return read(keyFor(guild,item.id))?.owner ? 'collected' : 'unverified';
+  }
+
+  async function openWorkerRoute(guild,id) {
+    if (route(location.pathname)?.[2]===id && route(location.pathname)?.[1]===guild) return true;
+    // Prefer Discord's own SPA navigation when the thread is rendered.
+    const sidebar=document.querySelector('[data-list-item-id="channels___'+id+'"][aria-label*="(thread)"]');
+    if (sidebar) {
+      sidebar.click();
+      const until=Date.now()+4500;
+      while (Date.now()<until) {
+        if (route(location.pathname)?.[1]===guild && route(location.pathname)?.[2]===id) return true;
+        await delay(200);
+      }
+    }
+    // Fallback: full navigation, retaining a worker marker across reloads.
+    location.replace(location.origin+'/channels/'+guild+'/'+id+SCAN_HASH+scanToken);
+    return false;
+  }
+
+  let workerBusy=false;
+  async function runScanWorker() {
+    if (!isScanWorker || workerBusy) return;
+    workerBusy=true;
+    try {
+      while (true) {
+        const m=route(location.pathname);
+        const guild=m?.[1];
+        const key=guild && scanJobKey(guild);
+        const job=key && read(key);
+        if (!job || job.id!==scanToken || job.status!=='running') {closeWorker();return;}
+        if (job.index>=job.queue.length) {
+          job.status='complete';job.heartbeat=Date.now();job.updated=Date.now();
+          write(key,job);closeWorker();return;
+        }
+        if (!navigator.onLine) {
+          job.heartbeat=Date.now();write(key,job);await delay(1500);continue;
+        }
+        const item=job.queue[job.index];
+        if (!(await openWorkerRoute(guild,item.id))) return;
+        job.heartbeat=Date.now();job.updated=Date.now();write(key,job);
+        const result=await visitThread(guild,item);
+        const current=read(key);
+        if (!current || current.id!==job.id || current.status!=='running') {
+          closeWorker();return;
+        }
+        // Another tab may have added tickets while this page was loading.
+        if (current.index!==job.index) continue;
+        current.results[item.id]=result;
+        current.index++;
+        current.heartbeat=Date.now();
+        current.updated=Date.now();
+        write(key,current);
+        await delay(500);
+      }
+    } catch (error) {
+      const m=route(location.pathname), key=m && scanJobKey(m[1]);
+      const job=key && read(key);
+      if (job && job.id===scanToken) {
+        job.status='interrupted';
+        job.error='Scanner error: '+(error?.message || String(error));
+        write(key,job);
+      }
+      closeWorker();
+    } finally {
+      workerBusy=false;
+    }
+  }
+
   function tick() {
     catchClosures();
     const m = route(location.pathname);
@@ -418,8 +668,9 @@
       if(context!==m[0]) { context=m[0]; seen=new WeakMap(); watchSince.clear(); msg(''); }
       if(boardGuild!==m[1]) {boardGuild=m[1];lastView='';}
       scan(m[1],m[2]); captureReplies(m[1],m[2]);
+      if (!isScanWorker) maybeStartSessionScan(m[1]);
     }
-    render();
+    if (!isScanWorker) render();
   }
   function setBoard(open) {
     $('#board').hidden = !open;
@@ -459,8 +710,31 @@
   launcher.onclick=e=>{if(!moved || e.detail===0)setBoard($('#board').hidden);moved=false;};
   window.addEventListener('resize',restorePosition);
   if(standalone){host.setAttribute('data-full','');$('#board').hidden=false;}
+  if(isScanWorker) {$('#launch').hidden=true;$('#board').hidden=true;}
   
   $('#close').onclick=()=>setBoard(false);
+  $('#scanNow').onclick=()=>{
+    const m=route(location.pathname);if(!m)return;
+    const current=read(scanJobKey(m[1]));
+    if(current?.status==='running')return;
+    const queue=discoverThreads();
+    if(!queue.length){msg('No visible sidebar threads found.');return;}
+    const job=makeScanJob(m[1],browserSession(),queue);
+    write(scanJobKey(m[1]),job);
+    launchScan(m[1],true);render();
+  };
+  $('#scanToggle').onclick=()=>{
+    const m=route(location.pathname);if(!m)return;
+    const key=scanJobKey(m[1]), job=read(key);if(!job)return;
+    if(job.status==='running') {
+      job.status='paused';job.updated=Date.now();write(key,job);
+      msg('Scan paused. The scanner will finish its current ticket before stopping.');
+    } else if(['paused','ready','interrupted'].includes(job.status)) {
+      job.status='ready';job.error='';write(key,job);
+      launchScan(m[1],true);
+    }
+    render();
+  };
   root.addEventListener('keydown',e=>{
     if(!standalone && e.key==='Escape' && !$('#board').hidden) {
       e.stopPropagation(); setBoard(false);
@@ -479,11 +753,14 @@
     msg(active?'Log watch removed.':'Watching this channel for loaded Tickety opening messages with a ticket link.');
   };
   function checkReminders() {
-    if(!read('alerts'))return;
+    if(isScanWorker || !read('alerts'))return;
     if(navigator.locks) navigator.locks.request(PREFIX+'notify',{ifAvailable:true},lock=>{if(lock)reminders();});
     else reminders();
   }
   window.addEventListener('storage',e=>{if(e.key?.startsWith(PREFIX)){if(e.key.startsWith(PREFIX+'messages.')) {summaries.delete(e.key.slice(PREFIX.length));refreshHistory(e.key.slice(PREFIX.length));render();return;} if(e.key.startsWith(PREFIX+'log.'))seen=new WeakMap();render();}});
   window.addEventListener('focus',()=>{tick();checkReminders();});
-  setInterval(tick,4000);setInterval(checkReminders,60000);tick();restorePosition();checkReminders();
+  window.addEventListener('online',()=>{tick();if(isScanWorker)runScanWorker();});
+  setInterval(tick,4000);setInterval(checkReminders,60000);
+  tick();restorePosition();checkReminders();
+  if(isScanWorker)runScanWorker();
 })();

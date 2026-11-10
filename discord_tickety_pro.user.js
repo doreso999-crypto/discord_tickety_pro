@@ -1,10 +1,13 @@
 // ==UserScript==
 // @name         Discord Tickety Pro
 // @namespace    doreso999-crypto/discord_tickety_pro
-// @version      1.4.0
+// @version      1.4.1
 // @description  Group Tickety tickets, scan sidebar threads once per session, and remind staff to follow up.
 // @match        https://discord.com/*
 // @run-at       document-idle
+// @updateURL    https://raw.githubusercontent.com/doreso999-crypto/discord_tickety_pro/main/discord_tickety_pro.user.js
+// @downloadURL  https://raw.githubusercontent.com/doreso999-crypto/discord_tickety_pro/main/discord_tickety_pro.user.js
+// @grant        GM_info
 // @grant        GM_notification
 // @grant        GM_openInTab
 // @grant        GM_closeTab
@@ -12,6 +15,7 @@
 
 (() => {
   'use strict';
+  const VERSION = typeof GM_info !== 'undefined' && GM_info?.script?.version || '1.4.1';
   const HOUR = 3600000;
   const PREFIX = 'ticketyPro.1.';
   const route = path => /^\/channels\/(\d{15,20})\/(\d{15,20})(?:\/|$)/.exec(path);
@@ -97,6 +101,7 @@
       #board{bottom:64px;width:min(580px,calc(100vw - 32px));max-height:min(800px,calc(100dvh - 86px));display:flex;flex-direction:column;background:#191c25;border:1px solid #474b5e;border-radius:15px;box-shadow:0 12px 52px #0007;overflow:hidden}
       header,footer,.bar,.fields,.filters,.topline,summary{display:flex;align-items:center;gap:8px}
       header{padding:16px 18px 10px}h2{font-size:19px;letter-spacing:-.03em;margin:0;flex:1}
+      #version{font-size:11px;color:#d3d6e6;border:1px solid #474b5e;border-radius:5px;padding:3px 6px;white-space:nowrap}
       #close{font-size:20px;padding:0;width:32px;height:32px}
       .bar{padding:0 18px 12px}.bar input{min-width:0;flex:1;background:#10131b}
       .filters{padding:0 18px 12px;gap:5px;flex-wrap:wrap;border-bottom:1px solid #383d4d}
@@ -127,9 +132,9 @@
       :host([data-full]) #board{inset:0;width:100vw;height:100dvh;max-height:none;max-width:none;border-radius:0;box-shadow:none;padding-inline:max(8px,calc((100vw - 1060px)/2));z-index:2147483647}
       :host([data-full]) #list{flex:1}:host([data-full]) #detach,:host([data-full]) #close{display:none}
     </style>
-    <button id="launch" aria-expanded="false" aria-controls="board" hidden>Ticket board</button>
+    <button id="launch" aria-expanded="false" aria-controls="board" hidden>Ticket board v1.4.1</button>
     <section id="board" hidden aria-label="Tickety ticket board">
-      <header><h2>Ticket board</h2><a id="detach" target="_blank" rel="noopener">Open in tab ↗</a><button id="close" aria-label="Close ticket board">×</button></header>
+      <header><h2>Ticket board</h2><span id="version" title="Installed userscript version">v1.4.1</span><a id="detach" target="_blank" rel="noopener">Open in tab ↗</a><button id="close" aria-label="Close ticket board">×</button></header>
       <div class="bar"><input id="search" type="search" aria-label="Search opener or ticket" placeholder="Search opener or ticket"><select id="sort" aria-label="Sort tickets within each opener"><option value="due">Expiring first</option><option value="age">Oldest ticket first</option><option value="latest">Latest activity first</option></select></div>
       <div class="filters" role="group" aria-label="Filter tickets"></div>
       <small class="viewer-help">Session scanner checks visible sidebar threads in one background tab. Only Tickety-confirmed tickets appear below. Scanning may mark threads as read.</small>
@@ -139,6 +144,7 @@
       <footer><button id="scanNow">Scan all now</button><button id="scanToggle">Pause scan</button><button id="log">Watch this log</button><button id="alerts">Enable alerts</button></footer>
     </section>`;
   const $ = s => root.querySelector(s);
+  $('#version').textContent = 'v' + VERSION;
   const msg = s => { $('#msg').textContent = s; };
   const element = (tag, label) => Object.assign(document.createElement(tag), {textContent:label});
   let context = '', boardGuild = '', seen = new WeakMap();
@@ -344,7 +350,7 @@
     const sort = $('#sort').value;
     const all = rows(guild).sort((a,b) => sort === 'age' ? a.opened-b.opened : sort === 'latest' ? b.latest-a.latest : a.due-b.due);
     const now = Date.now(), due = all.filter(t => stage(t,now)).length;
-    $('#launch').textContent = 'Ticket board · ' + all.length + (due ? ' · ' + due + ' due' : '');
+    $('#launch').textContent = 'Ticket board v' + VERSION + ' · ' + all.length + (due ? ' · ' + due + ' due' : '');
     if ($('section').hidden) return;
     renderClosures();
     $('#alerts').textContent = read('alerts') ? 'Disable alerts' : 'Enable alerts';

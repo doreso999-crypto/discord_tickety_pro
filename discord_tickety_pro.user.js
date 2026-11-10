@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         Discord Tickety Pro
 // @namespace    doreso999-crypto/discord_tickety_pro
-// @version      1.1.1
+// @version      1.2.0
 // @description  Group visible Tickety tickets by opener and remind staff to follow up.
 // @match        https://discord.com/*
 // @run-at       document-idle
@@ -17,7 +17,7 @@
   const write = (key, data) => localStorage.setItem(PREFIX + key, JSON.stringify(data));
   const keyFor = (guild, id) => 'ticket.' + guild + '.' + id;
   const created = id => Number(BigInt(id) >> 22n) + 1420070400000;
-  const statuses = ['Open', 'Follow up', 'Resolved'];
+  
   function rows(guild) {
     return Object.keys(localStorage).filter(k => k.startsWith(PREFIX + 'ticket.' + guild + '.'))
       .map(k => JSON.parse(localStorage.getItem(k))).filter(Boolean);
@@ -76,17 +76,14 @@
       #editor strong{display:block;margin-bottom:8px}.fields{align-items:end;flex-wrap:wrap}.fields label{flex:1;min-width:125px;font-size:12px;color:#c8cbd9}.fields input{display:block;width:100%;margin-top:4px}.primary{background:#535294;color:white}.empty{display:block;padding:18px 8px}
       @media(max-width:480px){#launch,#board{right:8px}#board{width:calc(100vw - 16px)}header,.bar,.filters,#editor,footer{padding-left:10px;padding-right:10px}.topline{flex-wrap:wrap}.topline a{min-width:45%}}
       @media(max-height:520px){#board{top:6px;bottom:6px;max-height:none}#editor{overflow:auto;max-height:40dvh}}
+      .viewer-help{padding:8px 18px}.history{white-space:pre-wrap;overflow-wrap:anywhere}.history p{margin:6px 0 12px}.history summary{font-size:12px}
     </style>
     <button id="launch" aria-expanded="false" aria-controls="board" hidden>Ticket board</button>
     <section id="board" hidden aria-label="Tickety ticket board">
       <header><h2>Ticket board</h2><button id="close" aria-label="Close ticket board">×</button></header>
-      <div class="bar"><input id="search" type="search" aria-label="Search opener or ticket" placeholder="Search opener or ticket"><button id="add" class="primary">Track this ticket</button></div>
+      <div class="bar"><input id="search" type="search" aria-label="Search opener or ticket" placeholder="Search opener or ticket"></div>
       <div class="filters" role="group" aria-label="Filter tickets"></div>
-      <form id="editor" hidden><strong id="editing"></strong><div class="fields">
-        <label>Opener<input id="owner" maxlength="120" autocomplete="off"></label>
-        <label>Close time (local)<input id="deadline" type="datetime-local"></label>
-        <button class="primary">Save</button><button type="button" id="cancel">Cancel</button>
-      </div></form>
+      <small class="viewer-help">Open a ticket to collect its visible messages. Keep it open in a separate tab for reply alerts while you work elsewhere.</small>
       <small role="status" id="msg"></small><div id="list"></div>
       <footer><button id="log">Watch this log</button><button id="alerts">Enable alerts</button></footer>
     </section>`;
@@ -143,42 +140,82 @@
       save(guild,id,{owner:old?.owner || owner, name:name || old?.name || (id === channel ? currentTicket(channel).name : 'Ticket ' + id)});
     }
   }
-  let editing = null;
-  let returnFocus;
-  function closeEditor() {
-    editing = null;
-    $('#editor').hidden = true;
-    if (returnFocus?.isConnected) returnFocus.focus();
-    else $('#search').focus();
+  const historyKey = (guild,id) => 'messages.' + guild + '.' + id;
+  const observedRows = new WeakMap();
+  const openedHistory = new Set();
+  const watchSince = new Map();
+  function readReply(node, id) {
+    const content = node.querySelector('[id="message-content-' + id + '"]');
+    const timestamp = node.querySelector('[id="message-timestamp-' + id + '"]');
+    if (!content || !timestamp) return null;
+    const article = node.querySelector('[aria-labelledby*="message-username-"]');
+    const reference = article?.getAttribute('aria-labelledby').match(/\bmessage-username-\d+\b/);
+    const header = reference && document.getElementById(reference[0]);
+    if (!header || header.querySelector('[aria-label$="App" i]')) return null;
+    const author = (header.querySelector('[data-text]') || header).textContent.trim();
+    if (!author || author.toLowerCase() === 'tickety') return null;
+    const copy = content.cloneNode(true);
+    copy.querySelectorAll('[class*="timestamp_"]').forEach(el=>el.remove());
+    const text = copy.textContent.trim();
+    const attachments = [...node.querySelectorAll('a[data-role="img"],a[class*="attachmentName"]')]
+      .map(a=>a.textContent.trim() || 'Image attachment');
+    const time = Date.parse(timestamp.dateTime);
+    if (!Number.isFinite(time) || (!text && !attachments.length)) return null;
+    return {id,author,time,text:[text,...attachments].filter(Boolean).join('\n')};
   }
-  function editTicket(t) {
-    editing = t;
-    returnFocus = root.activeElement;
-    const d = new Date(t.due);
-    $('#owner').value = t.owner;
-    $('#deadline').value = new Date(d.getTime()-d.getTimezoneOffset()*60000).toISOString().slice(0,16);
-    editing = {...t, localTime:$('#deadline').value};
-    $('#editing').textContent = t.name;
-    $('#editor').hidden = false;
-    $('#owner').focus();
+  function captureReplies(guild,channel) {
+    const batches = new Map();
+    for (const node of document.querySelectorAll('li[id^="chat-messages-"]')) {
+      const match = /^chat-messages-(\d+)-(\d+)$/.exec(node.id);
+      if (!match) continue;
+      const [,thread,id] = match;
+      if (thread !== channel && !threadTitle(node.closest('main[aria-label]'))) continue;
+      const ticket = read(keyFor(guild,thread));
+      if (!ticket) continue;
+      const key = historyKey(guild,thread);
+      if (!watchSince.has(key)) watchSince.set(key,Date.now());
+      const signature = node.id + '\n' + node.textContent;
+      if (observedRows.get(node) === signature) continue;
+      const reply = readReply(node,id);
+      if (!reply) continue;
+      if (!batches.has(key)) batches.set(key,{ticket,items:[],since:watchSince.get(key)});
+      batches.get(key).items.push({node,signature,reply});
+    }
+    for (const [key,{ticket,items,since}] of batches) {
+      const commit = () => {
+        const history = read(key) || {};
+        const fresh = [];
+        let changed = false;
+        for (const {node,reply} of items) {
+          const old = history[reply.id];
+          if (!old && reply.time >= since && !node.querySelector('[role="button"][aria-label="Edit"]')) fresh.push(reply);
+          if (!old || old.text !== reply.text || old.author !== reply.author) {
+            history[reply.id] = reply; changed = true;
+          }
+        }
+        if (changed) write(key,history);
+        items.forEach(({node,signature})=>observedRows.set(node,signature));
+        if (changed) refreshHistory(key);
+        if (fresh.length && read('alerts')) {
+          const latest = fresh[fresh.length-1];
+          GM_notification({title:ticket.name,text:latest.author+' · '+latest.text.slice(0,160),
+            onclick:()=>window.open('/channels/'+guild+'/'+ticket.id+'/'+latest.id,'_blank','noopener')});
+        }
+      };
+      const failed = ()=>msg('Could not save ticket messages in this browser.');
+      if (navigator.locks) navigator.locks.request(PREFIX+key,commit).catch(failed);
+      else {try {commit();} catch {failed();}}
+    }
   }
-  $('#cancel').onclick = closeEditor;
-  $('#editor').onsubmit = event => {
-    event.preventDefault();
-    if (!editing || route(location.pathname)?.[1] !== editing.guild) return;
-    const owner = $('#owner').value.trim().replace(/^@/, '');
-    if (!owner && !editing.owner && !read(keyFor(editing.guild,editing.id))) {
-      msg('Enter an opener to track this ticket.'); $('#owner').focus(); return;
-    }
-    const fields = {owner, name:editing.name};
-    if ($('#deadline').value !== editing.localTime) {
-      const due = new Date($('#deadline').value).getTime();
-      if (!Number.isFinite(due)) {msg('Enter a valid close time.'); return;}
-      Object.assign(fields,{due,exact:true,notified:''});
-    }
-    save(editing.guild,editing.id,fields);
-    closeEditor(); render(); msg('Ticket saved.');
-  };
+  function refreshHistory(key) {
+    const panel = root.getElementById(key);
+    if (!panel?.open) return;
+    const body = panel.lastElementChild;
+    body.replaceChildren();
+    const messages = Object.values(read(key) || {}).sort((a,b)=>a.time-b.time || a.id.localeCompare(b.id));
+    if (!messages.length) body.append(element('small','Open this ticket to collect visible replies.'));
+    for (const m of messages) body.append(element('small',m.author+' · '+new Date(m.time).toLocaleString()),element('p',m.text));
+  }
   function button(label, action) {
     const b = element('button',label); b.onclick = action; return b;
   }
@@ -190,7 +227,7 @@
     if (f === 'Due soon') return Boolean(stage(t,now));
     return t.status === f;
   };
-  for (const label of ['Active','Due soon','Follow up','Resolved','All']) {
+  for (const label of ['Active','Due soon','All']) {
     const tab = button(label,()=>{filter=label;render();});
     tab.dataset.filter = label;
     const count = element('span',''); count.className='count'; tab.append(count);
@@ -199,7 +236,7 @@
   function render() {
     const m = route(location.pathname);
     $('#launch').hidden = !m;
-    if (!m) { $('#board').hidden = true; $('#launch').setAttribute('aria-expanded','false'); $('#editor').hidden=true; editing=null; return; }
+    if (!m) { $('#board').hidden = true; $('#launch').setAttribute('aria-expanded','false'); return; }
     const [,guild,channel] = m;
     const all = rows(guild).sort((a,b) => a.due-b.due);
     const now = Date.now(), due = all.filter(t => stage(t,now)).length;
@@ -249,12 +286,13 @@
         const warning = stage(t,now);
         const date = element('small',(t.exact?'Close time':'7-day estimate') + ' · ' + new Date(t.due).toLocaleString() + (warning?' · '+warning:''));
         if (warning) date.className='alert';
-        const state = document.createElement('select'); state.setAttribute('aria-label','Ticket status');
-        statuses.forEach(s=>state.add(new Option(s,s))); state.value=t.status;
-        state.onchange=()=>{save(guild,t.id,{status:state.value,notified:''});render();};
-        const line = element('div',''); line.className='topline';
-        line.append(link,state,button('Edit',()=>editTicket(t)));
-        card.append(line,date); group.append(card);
+        link.target='_blank'; link.rel='noopener';
+        const key = historyKey(guild,t.id);
+        const history = element('details',''); history.className='history'; history.id=key;
+        history.open=openedHistory.has(key);
+        history.append(element('summary','Messages'),element('div',''));
+        history.ontoggle=()=>{if (!history.isConnected) return; if(history.open){openedHistory.add(key);refreshHistory(key);} else openedHistory.delete(key);};
+        card.append(link,date,history); group.append(card);
       }
       list.append(group);
     }
@@ -276,9 +314,9 @@
   function tick() {
     const m = route(location.pathname);
     if (m) {
-      if(context!==m[0]) { context=m[0]; seen=new WeakMap(); editing=null; $('#editor').hidden=true; msg(''); }
+      if(context!==m[0]) { context=m[0]; seen=new WeakMap(); watchSince.clear(); msg(''); }
       if(boardGuild!==m[1]) {boardGuild=m[1];lastView='';}
-      scan(m[1],m[2]);
+      scan(m[1],m[2]); captureReplies(m[1],m[2]);
     }
     render();
   }
@@ -286,26 +324,20 @@
     $('#board').hidden = !open;
     $('#launch').setAttribute('aria-expanded',String(open));
     if(open) {render(); $('#search').focus();}
-    else {editing=null; $('#editor').hidden=true; $('#launch').focus();}
+    else {$('#launch').focus();}
   }
   $('#launch').onclick=()=>setBoard($('#board').hidden);
   $('#close').onclick=()=>setBoard(false);
   root.addEventListener('keydown',e=>{
     if(e.key==='Escape' && !$('#board').hidden) {
-      e.stopPropagation(); if(editing)closeEditor(); else setBoard(false);
+      e.stopPropagation(); setBoard(false);
     }
   });
   $('#search').oninput=render;
   $('#alerts').onclick=()=>{
     const enabled=!read('alerts');write('alerts',enabled); render();
-    msg(enabled?'Alerts enabled at 24 hours, 6 hours and past due. Keep Discord Web running.':'Desktop alerts disabled.');
+    msg(enabled?'Reply alerts enabled for open ticket tabs. Deadline alerts run at 24 hours, 6 hours and past due.':'Desktop alerts disabled.');
     if(enabled) checkReminders();
-  };
-  $('#add').onclick=()=>{
-    const m=route(location.pathname); if(!m)return;
-    const old=read(keyFor(m[1],m[2]));
-    editTicket(old || {guild:m[1],id:m[2],name:currentTicket(m[2]).name,
-      owner:'',due:created(m[2])+168*HOUR});
   };
   $('#log').onclick=()=>{
     const m=route(location.pathname); if(!m)return;
@@ -318,7 +350,7 @@
     if(navigator.locks) navigator.locks.request(PREFIX+'notify',{ifAvailable:true},lock=>{if(lock)reminders();});
     else reminders();
   }
-  window.addEventListener('storage',e=>{if(e.key?.startsWith(PREFIX)){if(e.key.startsWith(PREFIX+'log.'))seen=new WeakMap();render();}});
+  window.addEventListener('storage',e=>{if(e.key?.startsWith(PREFIX)){if(e.key.startsWith(PREFIX+'messages.')) {refreshHistory(e.key.slice(PREFIX.length));return;} if(e.key.startsWith(PREFIX+'log.'))seen=new WeakMap();render();}});
   window.addEventListener('focus',()=>{tick();checkReminders();});
   setInterval(tick,4000);setInterval(checkReminders,60000);tick();checkReminders();
 })();

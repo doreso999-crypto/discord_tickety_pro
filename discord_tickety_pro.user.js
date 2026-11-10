@@ -823,23 +823,27 @@
     return false;
   }
 
-  async function visitThread(guild,item) {
+  async function visitThread(guild,item,live=false) {
     const main=await waitForThread(item.id);
-    if (!main) return 'unverified';
+    if(!main)return 'unverified';
     const scroller=getThreadScroller(main);
-    if (!scroller) return 'unverified';
+    if(!scroller)return 'unverified';
     captureThreadSlice(guild,item.id);
-    // First reveal the ticket-creation embed, even when Discord initially
-    // opens midway through a thread instead of at its earliest message.
+    if(live){
+      // Scan only the most recent messages. The first pass already saved
+      // the opener and older messages. Continue from the current viewport
+      // through lazy-loaded newer content.
+      const latest=await sweepThread(guild,item.id,main,scroller,'down',LIVE_TAIL_MS);
+      captureThreadSlice(guild,item.id);
+      await delay(350);
+      return read(keyFor(guild,item.id))?.owner && latest?'collected':'partial';
+    }
     const beginning=await sweepThread(guild,item.id,main,scroller,'up',9000);
-    // Traverse forward in viewport-sized steps; collect messages at each
-    // step and wait for the newest messages to actually finish loading.
     const latest=await sweepThread(guild,item.id,main,scroller,'down',16000);
     captureThreadSlice(guild,item.id);
-    await delay(450); // finish pending navigator.locks writes
+    await delay(450);
     const owner=read(keyFor(guild,item.id))?.owner;
-    return owner && beginning && latest ? 'collected'
-      : owner ? 'partial' : 'unverified';
+    return owner && beginning && latest?'collected':owner?'partial':'unverified';
   }
 
   async function openWorkerRoute(guild,id) {
@@ -861,61 +865,87 @@
 
   let workerBusy=false;
   async function runScanWorker() {
-    if (!isScanWorker || workerBusy) return;
+    if(!isScanWorker||workerBusy)return;
     workerBusy=true;
-    try {
-      while (true) {
-        const m=route(location.pathname);
-        const guild=m?.[1];
-        const key=guild && scanJobKey(guild);
-        const job=key && read(key);
-        if (!job || job.id!==scanToken || job.status!=='running') {closeWorker();return;}
-        if (job.index>=job.queue.length) {
-          job.status='complete';job.heartbeat=Date.now();job.updated=Date.now();
-          write(key,job);closeWorker();return;
-        }
-        if (!navigator.onLine) {
-          job.heartbeat=Date.now();write(key,job);await delay(1500);continue;
-        }
-        const item=job.queue[job.index];
-        if (!(await openWorkerRoute(guild,item.id))) return;
-        job.heartbeat=Date.now();job.updated=Date.now();write(key,job);
-        const result=await visitThread(guild,item);
-        const current=read(key);
-        if (!current || current.id!==job.id || current.status!=='running') {
+    try{
+      while(true){
+        const m=route(location.pathname),guild=m?.[1],key=guild&&scanJobKey(guild);
+        const job=key&&read(key);
+        if(!job||job.id!==scanToken||!['running','monitoring'].includes(job.status)){
           closeWorker();return;
         }
-        // Another tab may have added tickets while this page was loading.
-        if (current.index!==job.index) continue;
-        current.results[item.id]=result;
-        current.attempts ||= {};
-        if (result!=='collected') {
-          const attempts=(current.attempts[item.id]||0)+1;
-          current.attempts[item.id]=attempts;
-          // One retry after the initial pass. Avoid infinite loops on
-          // inaccessible threads or background-tab rendering failures.
-          if (attempts<2 && !current.queue.slice(current.index+1).some(t=>t.id===item.id)) {
-            current.queue.push({...item,retry:true});
+        if(!navigator.onLine){await delay(LIVE_IDLE_MS);continue;}
+        let item=null,mode='initial';
+        const queue=job.queue||[];
+        // Changed sidebar threads jump ahead of the initial scan queue.
+        const pending=(job.pending||[]).find(id=>job.results?.[id]);
+        if(pending){
+          item=queue.find(t=>t.id===pending)||{id:pending};
+          mode='live';
+        }else if(job.status==='running'&&job.index<queue.length){
+          item=queue[job.index];
+        }else{
+          if(job.status!=='monitoring'){
+            job.status='monitoring';job.heartbeat=Date.now();job.updated=Date.now();
+            write(key,job);
+          }
+          // Check EVERY previously scanned ticket eventually, including
+          // threads with no red badge. Discord badges aren't full message
+          // change notifications. Oldest-first balances monitoring fairly.
+          const checked=job.checkedAt||{};
+          const visited=[...new Map(queue.filter(t=>job.results?.[t.id]).map(t=>[t.id,t])).values()];
+          visited.sort((a,b)=>(checked[a.id]||0)-(checked[b.id]||0));
+          item=visited.find(t=>Date.now()-(checked[t.id]||0)>=LIVE_RECHECK_MS);
+          if(item)mode='live';
+          else{
+            if(Date.now()-job.heartbeat>12000){
+              job.heartbeat=Date.now();write(key,job);
+            }
+            await delay(LIVE_IDLE_MS);continue;
           }
         }
-        current.index++;
-        current.heartbeat=Date.now();
-        current.updated=Date.now();
+        if(!item){await delay(LIVE_IDLE_MS);continue;}
+        if(!(await openWorkerRoute(guild,item.id)))return;
+        const active=read(key);
+        if(!active||active.id!==job.id||!['running','monitoring'].includes(active.status)){
+          closeWorker();return;
+        }
+        active.heartbeat=Date.now();active.updated=Date.now();write(key,active);
+        const result=await visitThread(guild,item,mode==='live');
+        const current=read(key);
+        if(!current||current.id!==job.id||!['running','monitoring'].includes(current.status)){
+          closeWorker();return;
+        }
+        current.checkedAt||={};
+        current.checkedAt[item.id]=Date.now();
+        current.heartbeat=Date.now();current.updated=Date.now();
+        if(mode==='live'){
+          current.liveChecks=(current.liveChecks||0)+1;
+          current.pending=(current.pending||[]).filter(id=>id!==item.id);
+          if(result==='collected')current.results[item.id]='collected';
+        }else{
+          if(current.index!==job.index)continue;
+          current.results[item.id]=result;
+          current.attempts||={};
+          if(result!=='collected'){
+            const attempts=(current.attempts[item.id]||0)+1;
+            current.attempts[item.id]=attempts;
+            if(attempts<2&&!current.queue.slice(current.index+1).some(t=>t.id===item.id))
+              current.queue.push({...item,retry:true});
+          }
+          current.index++;
+        }
         write(key,current);
-        await delay(500);
+        await delay(mode==='live'?650:500);
       }
-    } catch (error) {
-      const m=route(location.pathname), key=m && scanJobKey(m[1]);
-      const job=key && read(key);
-      if (job && job.id===scanToken) {
-        job.status='interrupted';
-        job.error='Scanner error: '+(error?.message || String(error));
+    }catch(error){
+      const m=route(location.pathname),key=m&&scanJobKey(m[1]),job=key&&read(key);
+      if(job&&job.id===scanToken){
+        job.status='interrupted';job.error='Scanner: '+(error?.message||String(error));
         write(key,job);
       }
       closeWorker();
-    } finally {
-      workerBusy=false;
-    }
+    }finally{workerBusy=false;}
   }
 
   function tick() {

@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         Discord Tickety Pro
 // @namespace    doreso999-crypto/discord_tickety_pro
-// @version      1.4.3
+// @version      1.5.0
 // @description  Group Tickety tickets, scan sidebar threads once per session, and remind staff to follow up.
 // @match        https://discord.com/*
 // @run-at       document-idle
@@ -15,7 +15,7 @@
 
 (() => {
   'use strict';
-  const VERSION = '1.4.3'; // Report loaded GitHub code, not the outer Tampermonkey loader version.
+  const VERSION = '1.5.0'; // Report loaded GitHub code, not the outer Tampermonkey loader version.
   const HOUR = 3600000;
   const PREFIX = 'ticketyPro.1.';
   const route = path => /^\/channels\/(\d{15,20})\/(\d{15,20})(?:\/|$)/.exec(path);
@@ -31,55 +31,81 @@
     : sessionStorage.getItem(PREFIX + 'scanner.worker');
   const isScanWorker = Boolean(scanToken) && !standalone;
   if (location.hash.startsWith(SCAN_HASH)) sessionStorage.setItem(PREFIX + 'scanner.worker', scanToken);
-  const summaries = new Map();
-  function isCompletion(text) {
-    const sentence = text.toLowerCase().replace(/<@!?\d+>/g,'').trim();
-    if (/\?|\b(?:not|never|don't|didn't|cannot|can't|pending|waiting|need|any|will|before|please update|can you|could you|when|if|should|haven't|hasn't)\b/i.test(sentence)) return false;
-    return /\b(?:reactivated|updated|please close (?:the |this )?ticket)\b/.test(sentence)
-      || /^(?:update|close)(?:[.!✅\s]+|$)$/.test(sentence);
+  const summaries=new Map(), DAY=24*HOUR, FOLLOWUP=5*DAY;
+  const TYPE_OPTIONS=['Monitoring issues','POA + ID','POA','ID','DOCS','Credit reports','Other'];
+  const normalize=s=>String(s||'').toLowerCase().trim().replace(/^@/,'');
+  function isCompletion(text){
+    const s=normalize(text).replace(/<@!?\d+>/g,'');
+    if(!s || /\?|\b(?:not|never|no|don't|didn't|cannot|can't|pending|waiting|need|needs|will|before|can you|could you|when|if|should|haven't|hasn't|still|unresolved|please update)\b/.test(s))return false;
+    return /\b(?:reactivated|updated|completed|resolved|finished|done|all set|ready to close|good to close|please close (?:the |this )?ticket)\b/.test(s)
+      || /^(?:update|close|closed|complete)(?:[.!✅\s]+|$)$/.test(s);
   }
-  function inspectTicket(t) {
-    const key = historyKey(t.guild,t.id);
-    const identity = JSON.stringify([t.owner,t.ownerAlias]);
-    let summary = summaries.get(key);
-    if (!summary || summary.identity !== identity) {
-      const opened = created(t.id);
-      const owners = [t.owner,t.ownerAlias].filter(Boolean).map(s=>s.trim().replace(/^@/,'').toLowerCase());
-      let latest = opened, signal = null;
-      for (const m of Object.values(read(key) || {})) {
-        latest = Math.max(latest,m.time);
-        if (owners.length && !owners.includes(m.author.trim().replace(/^@/,'').toLowerCase()) &&
-            isCompletion(m.text) && (!signal || m.time > signal.time)) signal = m;
+  function ticketType(name){
+    const s=normalize(name),p=/\bpoa\b|proof[\s-]*of[\s-]*address/.test(s),
+      i=/\bids?\b|\bidentification\b|identity document/.test(s);
+    if(/monitor(?:ing)?[\s_-]*(?:issues?|problems?|concerns?)|issues?[\s_-]*monitor/.test(s))return 'Monitoring issues';
+    if(p&&i)return 'POA + ID';
+    if(p)return 'POA';
+    if(i)return 'ID';
+    if(/\bdocs?\b|documents?|paperwork|uploads?\b/.test(s))return 'DOCS';
+    if(/\bcredit[\s_-]*(?:reports?|files?)\b|\breports?\b/.test(s))return 'Credit reports';
+    return 'Other';
+  }
+  function inspectTicket(t){
+    const key=historyKey(t.guild,t.id),identity=JSON.stringify([t.name,t.owner,t.ownerAlias,t.status]);
+    let summary=summaries.get(key);
+    if(!summary || summary.identity!==identity){
+      let last=null;
+      for(const m of Object.values(read(key)||{})){
+        if(!Number.isFinite(m.time)||!m.text)continue;
+        if(!last||m.time>last.time||(m.time===last.time&&String(m.id)>String(last.id)))last=m;
       }
-      const deadline = new Date(latest);
-      deadline.setDate(deadline.getDate()+6);
-      summary = {identity,opened,latest,signal,due:deadline.getTime()}; summaries.set(key,summary);
+      const latest=last?.time||null,signal=last&&isCompletion(last.text)?last:null;
+      const complete=t.status==='Resolved'||Boolean(signal);
+      summary={identity,opened:created(t.id),latest,last,signal,complete,
+        due:!complete&&latest?latest+FOLLOWUP:null,type:ticketType(t.name),user:t.owner||t.ownerAlias||'Unknown opener'};
+      summaries.set(key,summary);
     }
     return {...t,...summary};
   }
-  function ageDays(opened,now) {
-    const day = n=>{const d=new Date(n);return Date.UTC(d.getFullYear(),d.getMonth(),d.getDate());};
-    return Math.max(0,(day(now)-day(opened))/86400000);
+  function ageDays(opened,now){
+    const d=n=>{const x=new Date(n);return Date.UTC(x.getFullYear(),x.getMonth(),x.getDate());};
+    return Math.max(0,(d(now)-d(opened))/DAY);
   }
-  function rows(guild) {
-    return Object.keys(localStorage).filter(k => k.startsWith(PREFIX + 'ticket.' + guild + '.'))
-      .map(k => JSON.parse(localStorage.getItem(k))).filter(Boolean).map(inspectTicket);
+  function rows(guild){
+    return Object.keys(localStorage).filter(k=>k.startsWith(PREFIX+'ticket.'+guild+'.'))
+      .map(k=>JSON.parse(localStorage.getItem(k))).filter(Boolean).map(inspectTicket);
   }
-  function save(guild, id, fields) {
-    const key = keyFor(guild, id);
-    const previous = read(key);
-    const record = Object.assign({ guild, id, name: 'Ticket ' + id, owner: '', status: 'Open',
-      due: created(id) + 168 * HOUR, exact: false, notified: '' }, previous, fields);
-    if (JSON.stringify(previous) !== JSON.stringify(record)) write(key, record);
+  function save(guild,id,fields){
+    const key=keyFor(guild,id),old=read(key);
+    const record=Object.assign({guild,id,name:'Ticket '+id,owner:'',status:'Open',notified:''},old,fields);
+    if(JSON.stringify(old)!==JSON.stringify(record)){write(key,record);summaries.delete(historyKey(guild,id));}
     return record;
   }
-  function stage(t, now) {
-    if (t.status === 'Resolved') return '';
-    const hours = (t.due - now) / HOUR;
-    if (hours <= 0) return 'past due';
-    if (hours <= 6) return 'within 6h';
-    if (hours <= 24) return 'within 24h';
-    return '';
+  function stage(t,now){
+    return t.complete||t.status==='Resolved'||!t.latest||!t.due?'':now>=t.due?'Follow-up due':'';
+  }
+  function localDateKey(ms){
+    if(!Number.isFinite(ms))return '';
+    const d=new Date(ms);
+    return d.getFullYear()+'-'+String(d.getMonth()+1).padStart(2,'0')+'-'+String(d.getDate()).padStart(2,'0');
+  }
+  function compareTickets(a,b,mode,now){
+    const tie=()=>a.name.localeCompare(b.name,undefined,{sensitivity:'base'})||a.id.localeCompare(b.id);
+    switch(mode){
+      case 'new':return b.opened-a.opened||tie();
+      case 'old':return a.opened-b.opened||tie();
+      case 'recent':return (b.latest||0)-(a.latest||0)||b.opened-a.opened||tie();
+      case 'inactive':return (a.latest||Infinity)-(b.latest||Infinity)||tie();
+      case 'due':{
+        const ra=stage(a,now)?0:a.complete?2:1,rb=stage(b,now)?0:b.complete?2:1;
+        return ra-rb||(a.due||Infinity)-(b.due||Infinity)||(b.latest||0)-(a.latest||0)||tie();
+      }
+      case 'name':return tie();
+      case 'user':return a.user.localeCompare(b.user,undefined,{sensitivity:'base'})||tie();
+      case 'type':return TYPE_OPTIONS.indexOf(a.type)-TYPE_OPTIONS.indexOf(b.type)||tie();
+      default:return b.opened-a.opened||tie();
+    }
   }
   function opener(text) {
     const match = text.match(/(?:^|\n|\bticket )(?:opened by|created by|ticket creator|opener)[ \t]*:?[ \t]*(?:\n[ \t]*)?(@?[^\n]{1,80})(?=\n|$)/i)
@@ -132,9 +158,9 @@
       :host([data-full]) #board{inset:0;width:100vw;height:100dvh;max-height:none;max-width:none;border-radius:0;box-shadow:none;padding-inline:max(8px,calc((100vw - 1060px)/2));z-index:2147483647}
       :host([data-full]) #list{flex:1}:host([data-full]) #detach,:host([data-full]) #close{display:none}
     </style>
-    <button id="launch" aria-expanded="false" aria-controls="board" hidden>Ticket board v1.4.3</button>
+    <button id="launch" aria-expanded="false" aria-controls="board" hidden>Ticket board v1.5.0</button>
     <section id="board" hidden aria-label="Tickety ticket board">
-      <header><h2>Ticket board</h2><span id="version" title="Installed userscript version">v1.4.3</span><a id="detach" target="_blank" rel="noopener">Open in tab ↗</a><button id="close" aria-label="Close ticket board">×</button></header>
+      <header><h2>Ticket board</h2><span id="version" title="Installed userscript version">v1.5.0</span><a id="detach" target="_blank" rel="noopener">Open in tab ↗</a><button id="close" aria-label="Close ticket board">×</button></header>
       <div class="bar"><input id="search" type="search" aria-label="Search opener or ticket" placeholder="Search opener or ticket"><select id="sort" aria-label="Sort tickets within each opener"><option value="due">Expiring first</option><option value="age">Oldest ticket first</option><option value="latest">Latest activity first</option></select></div>
       <div class="filters" role="group" aria-label="Filter tickets"></div>
       <small class="viewer-help">Session scanner checks visible sidebar threads in one background tab. Only Tickety-confirmed tickets appear below. Scanning may mark threads as read.</small>

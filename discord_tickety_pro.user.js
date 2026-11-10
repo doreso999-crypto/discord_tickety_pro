@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         Discord Tickety Pro
 // @namespace    doreso999-crypto/discord_tickety_pro
-// @version      1.4.2
+// @version      1.4.3
 // @description  Group Tickety tickets, scan sidebar threads once per session, and remind staff to follow up.
 // @match        https://discord.com/*
 // @run-at       document-idle
@@ -15,7 +15,7 @@
 
 (() => {
   'use strict';
-  const VERSION = typeof GM_info !== 'undefined' && GM_info?.script?.version || '1.4.2';
+  const VERSION = '1.4.3'; // Report loaded GitHub code, not the outer Tampermonkey loader version.
   const HOUR = 3600000;
   const PREFIX = 'ticketyPro.1.';
   const route = path => /^\/channels\/(\d{15,20})\/(\d{15,20})(?:\/|$)/.exec(path);
@@ -132,16 +132,16 @@
       :host([data-full]) #board{inset:0;width:100vw;height:100dvh;max-height:none;max-width:none;border-radius:0;box-shadow:none;padding-inline:max(8px,calc((100vw - 1060px)/2));z-index:2147483647}
       :host([data-full]) #list{flex:1}:host([data-full]) #detach,:host([data-full]) #close{display:none}
     </style>
-    <button id="launch" aria-expanded="false" aria-controls="board" hidden>Ticket board v1.4.2</button>
+    <button id="launch" aria-expanded="false" aria-controls="board" hidden>Ticket board v1.4.3</button>
     <section id="board" hidden aria-label="Tickety ticket board">
-      <header><h2>Ticket board</h2><span id="version" title="Installed userscript version">v1.4.2</span><a id="detach" target="_blank" rel="noopener">Open in tab ↗</a><button id="close" aria-label="Close ticket board">×</button></header>
+      <header><h2>Ticket board</h2><span id="version" title="Installed userscript version">v1.4.3</span><a id="detach" target="_blank" rel="noopener">Open in tab ↗</a><button id="close" aria-label="Close ticket board">×</button></header>
       <div class="bar"><input id="search" type="search" aria-label="Search opener or ticket" placeholder="Search opener or ticket"><select id="sort" aria-label="Sort tickets within each opener"><option value="due">Expiring first</option><option value="age">Oldest ticket first</option><option value="latest">Latest activity first</option></select></div>
       <div class="filters" role="group" aria-label="Filter tickets"></div>
       <small class="viewer-help">Session scanner checks visible sidebar threads in one background tab. Only Tickety-confirmed tickets appear below. Scanning may mark threads as read.</small>
       <small role="status" id="scanStatus" aria-live="polite"></small>
       <details id="closedInbox"><summary>Closure notices</summary><div id="receipts" style="max-height:34vh;overflow:auto;padding:0 14px"></div></details>
       <small role="status" id="msg"></small><div id="list"></div>
-      <footer><button id="scanNow">Scan all now</button><button id="scanToggle">Pause scan</button><button id="log">Watch this log</button><button id="alerts">Enable alerts</button></footer>
+      <footer><button id="scanPriority">Scan red tickets</button><button id="scanNow">Scan all now</button><button id="scanToggle">Pause scan</button><button id="log">Watch this log</button><button id="alerts">Enable alerts</button></footer>
     </section>`;
   const $ = s => root.querySelector(s);
   $('#version').textContent = 'v' + VERSION;
@@ -451,24 +451,38 @@
   const delay = ms => new Promise(resolve => setTimeout(resolve, ms));
   const scanId = () => Date.now().toString(36) + '-' + Math.random().toString(36).slice(2, 10);
 
+
   function discoverThreads() {
     const found = new Map();
     for (const item of document.querySelectorAll('[data-list-item-id^="channels___"][aria-label*="(thread)"]')) {
       const id = item.getAttribute('data-list-item-id')?.match(/^channels___(\d{15,20})$/)?.[1];
       if (!id) continue;
+      const aria = item.getAttribute('aria-label') || '';
+      // The actual Discord sidebar uses "1 mention, Thread name (thread)"
+      // and a numberBadge_* element for red mention indicators.
+      const badgeText = item.querySelector('[class*="numberBadge_"]')?.textContent.trim() || '';
+      const mentionMatch = aria.match(/(?:^|,\s*)(\d+)\s+mentions?(?:,|$)/i);
+      const mentionCount = Math.max(Number(badgeText) || 0, Number(mentionMatch?.[1]) || 0);
+      const priority = mentionCount > 0 ? 2 : /(?:^|,\s*)unread(?:,|$)/i.test(aria) ? 1 : 0;
       const name = item.querySelector('[class*="name_"] [aria-hidden="true"]')?.textContent.trim()
         || item.querySelector('[class*="name_"]')?.textContent.trim()
-        || item.getAttribute('aria-label')?.replace(/^(?:\d+ mentions?,\s*)/i,'').replace(/\s*\(thread\).*$/i,'').trim()
+        || aria.replace(/^(?:(?:\d+ mentions?|unread),\s*)+/i,'').replace(/\s*\(thread\).*$/i,'').trim()
         || 'Ticket ' + id;
-      found.set(id, {id,name});
+      found.set(id, {id,name,priority,mentionCount});
     }
     const m = route(location.pathname);
     if (m) {
       const main = [...document.querySelectorAll('main[aria-label]')]
         .find(el => threadTitle(el) && el.querySelector('[id^="chat-messages-' + m[2] + '-"]'));
-      if (main && !found.has(m[2])) found.set(m[2], {id:m[2],name:threadTitle(main)});
+      if (main && !found.has(m[2]))
+        found.set(m[2], {id:m[2],name:threadTitle(main),priority:0,mentionCount:0});
     }
     return [...found.values()];
+  }
+
+  function prioritizeScanQueue(threads) {
+    return [...threads].sort((a,b)=>(b.priority||0)-(a.priority||0)
+      || (b.mentionCount||0)-(a.mentionCount||0));
   }
 
   // A resumed browser tab may restore sessionStorage. A shared, recently
@@ -487,7 +501,7 @@
   }
 
   function makeScanJob(guild,session,queue) {
-    return {guild,session,id:scanId(),queue,index:0,results:{},status:'ready',
+    return {guild,session,id:scanId(),queue:prioritizeScanQueue(queue),index:0,results:{},attempts:{},status:'ready',
       heartbeat:0,started:Date.now(),updated:Date.now(),error:''};
   }
 
@@ -555,12 +569,16 @@
     const status=$('#scanStatus'), action=$('#scanToggle'), now=$('#scanNow');
     const total=job?.queue.length || 0;
     const complete=Math.min(total,job?.index || 0);
-    const uncertain=Object.values(job?.results || {}).filter(v=>v!=='collected').length;
+    const resultSet=Object.values(job?.results || {});
+    const verified=resultSet.filter(v=>v==='collected').length;
+    const uncertain=resultSet.filter(v=>v!=='collected').length;
+    const red=job?.queue.filter(t=>t.priority===2).length || 0;
     const state=job?.status || 'waiting';
     const caption={ready:'Ready',running:'Scanning',paused:'Paused',complete:'Finished',
       interrupted:'Interrupted',waiting:'Waiting for threads'}[state] || state;
-    status.textContent='Session scan: '+caption+' · '+complete+'/'+total+' threads'
-      +(uncertain ? ' · '+uncertain+' unverified' : '')
+    status.textContent='Session scan: '+caption+' · '+complete+'/'+total+' visits · '+verified+' verified'
+      +(red ? ' · red priority' : '')
+      +(uncertain ? ' · '+uncertain+' incomplete' : '')
       +(job?.error ? ' · '+job.error : '')
       +(total ? ' · only verified Tickety tickets are listed' : '');
     action.textContent=state==='running' ? 'Pause scan' : 'Resume scan';
@@ -698,6 +716,16 @@
         // Another tab may have added tickets while this page was loading.
         if (current.index!==job.index) continue;
         current.results[item.id]=result;
+        current.attempts ||= {};
+        if (result!=='collected') {
+          const attempts=(current.attempts[item.id]||0)+1;
+          current.attempts[item.id]=attempts;
+          // One retry after the initial pass. Avoid infinite loops on
+          // inaccessible threads or background-tab rendering failures.
+          if (attempts<2 && !current.queue.slice(current.index+1).some(t=>t.id===item.id)) {
+            current.queue.push({...item,retry:true});
+          }
+        }
         current.index++;
         current.heartbeat=Date.now();
         current.updated=Date.now();
@@ -770,6 +798,22 @@
   if(isScanWorker) {$('#launch').hidden=true;$('#board').hidden=true;}
   
   $('#close').onclick=()=>setBoard(false);
+  $('#scanPriority').onclick=()=>{
+    const m=route(location.pathname);if(!m)return;
+    const active=read(scanJobKey(m[1]));
+    if(active?.status==='running') {
+      msg('A scan is already running. Pause it first if you want a new red-ticket scan.');
+      return;
+    }
+    const marked=discoverThreads().filter(t=>t.priority===2);
+    if (!marked.length) {
+      msg('No red-number threads found in the currently loaded sidebar.');return;
+    }
+    const job=makeScanJob(m[1],browserSession(),marked);
+    write(scanJobKey(m[1]),job);
+    launchScan(m[1],true);render();
+    msg('Prioritizing '+marked.length+' threads with red mention numbers. Red numbers may remain after background visits.');
+  };
   $('#scanNow').onclick=()=>{
     const m=route(location.pathname);if(!m)return;
     const current=read(scanJobKey(m[1]));

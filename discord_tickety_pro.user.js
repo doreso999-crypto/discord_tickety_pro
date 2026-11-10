@@ -157,13 +157,61 @@
       .evidence{color:#9be2bb;padding:4px 0}.history>div{padding:0 12px}
       :host([data-full]) #board{inset:0;width:100vw;height:100dvh;max-height:none;max-width:none;border-radius:0;box-shadow:none;padding-inline:max(8px,calc((100vw - 1060px)/2));z-index:2147483647}
       :host([data-full]) #list{flex:1}:host([data-full]) #detach,:host([data-full]) #close{display:none}
+
+      :host,:host *{font-family:Inter,"Segoe UI",Arial,sans-serif!important}
+      #board{width:min(850px,calc(100vw - 24px));max-height:min(870px,calc(100dvh - 72px))}
+      header{gap:12px;flex-wrap:wrap}
+      .bar{display:grid;grid-template-columns:minmax(150px,2fr) minmax(155px,1fr);gap:8px;padding:6px 18px 10px}
+      .bar input,.bar select,.more-filters select,.more-filters input{width:100%;min-width:0;background:#101b24;color:#eff4f6;border:1px solid #455968}
+      .more-filters{display:grid;grid-template-columns:repeat(4,minmax(0,1fr));gap:8px 10px;padding:0 18px 10px}
+      .more-filters label{font-size:11px;color:#cbd6df;display:flex;flex-direction:column;gap:4px;min-width:0}
+      .more-filters select,.more-filters input{height:34px;padding:5px 7px;font-size:12px}
+      #clearFilters{align-self:end;height:34px;font-size:12px}
+      #resultCount{display:block;padding:5px 18px 8px;color:#b9cbd6;font-size:12px}
+      #list{flex:1;padding:5px 13px 16px}
+      #list .ticket-group{border:1px solid #394a58;border-radius:8px;margin:7px 0;overflow:hidden}
+      #list .ticket-group>summary{min-height:39px;background:#213541;padding:9px 12px}
+      #list .ticket-card{padding:11px 13px;border-top:1px solid #344653;background:#192b35}
+      #list .ticket-title{display:flex;gap:9px;align-items:center;min-width:0;flex-wrap:wrap}
+      #list .ticket-title>a{font-weight:700;color:#b4edfc;overflow-wrap:anywhere;text-decoration:none;flex:1;min-width:120px}
+      #list .ticket-title>a:hover{text-decoration:underline}
+      .ticket-tag{border-radius:5px;background:#304657;color:#e0e9ee;padding:2px 7px;font-size:11px;white-space:nowrap}
+      .ticket-tag.done{color:#9ce6ba;background:#233d34}
+      .ticket-tag.overdue{color:#ffdab0;background:#56392c}
+      .ticket-meta{margin-top:6px;display:flex;gap:5px 15px;flex-wrap:wrap;font-size:12px;color:#b8cbd5}
+      .ticket-action{display:flex;align-items:center;gap:10px;flex-wrap:wrap;margin-top:7px}
+      .ticket-action button{font-size:11px;padding:4px 8px}
+      .ticket-note{color:#afdfbe;font-size:12px;overflow-wrap:anywhere}
+      .ticket-note.overdue{color:#ffcc9c}
+      .flat-view .ticket-card{border:1px solid #394a58;border-radius:7px;margin:8px 0}
+      #list .history{margin-top:8px}#list .history>summary{font-size:12px;border-radius:5px;padding:6px 8px}
+      footer{gap:6px;padding:10px 13px}footer button{white-space:nowrap}
+      @media(max-width:680px){.bar{grid-template-columns:1fr}.more-filters{grid-template-columns:repeat(2,minmax(0,1fr))}}
+      @media(max-width:370px){.more-filters{grid-template-columns:1fr}#board{width:calc(100vw - 12px);right:6px}}
     </style>
     <button id="launch" aria-expanded="false" aria-controls="board" hidden>Ticket board v1.5.0</button>
     <section id="board" hidden aria-label="Tickety ticket board">
       <header><h2>Ticket board</h2><span id="version" title="Installed userscript version">v1.5.0</span><a id="detach" target="_blank" rel="noopener">Open in tab ↗</a><button id="close" aria-label="Close ticket board">×</button></header>
-      <div class="bar"><input id="search" type="search" aria-label="Search opener or ticket" placeholder="Search opener or ticket"><select id="sort" aria-label="Sort tickets within each opener"><option value="due">Expiring first</option><option value="age">Oldest ticket first</option><option value="latest">Latest activity first</option></select></div>
-      <div class="filters" role="group" aria-label="Filter tickets"></div>
-      <small class="viewer-help">Session scanner checks visible sidebar threads in one background tab. Only Tickety-confirmed tickets appear below. Scanning may mark threads as read.</small>
+      <div class="bar">
+        <input id="search" type="search" autocomplete="off" aria-label="Search ticket name or user" placeholder="Search ticket, user, ID or category...">
+        <select id="sort" aria-label="Sort tickets">
+          <option value="new">Newest tickets first</option><option value="recent">Latest reply first</option>
+          <option value="due">Follow-ups first</option><option value="old">Oldest tickets first</option>
+          <option value="inactive">Oldest reply first</option><option value="name">Ticket name A–Z</option>
+          <option value="user">User name A–Z</option><option value="type">Ticket type</option>
+        </select>
+      </div>
+      <div class="more-filters">
+        <label>View by<select id="groupBy"><option value="owner">Users</option><option value="type">Ticket types</option><option value="flat">All tickets</option></select></label>
+        <label>User<select id="ownerFilter"><option value="">All users</option></select></label>
+        <label>Ticket type<select id="typeFilter"><option value="">All types</option></select></label>
+        <label>Date field<select id="dateField"><option value="opened">Ticket created</option><option value="latest">Last reply</option></select></label>
+        <label>From<input id="fromDate" type="date"></label><label>To<input id="toDate" type="date"></label>
+        <button id="clearFilters" type="button">Clear filters</button>
+      </div>
+      <div class="filters" role="group" aria-label="Status filter"></div>
+      <small id="resultCount" aria-live="polite"></small>
+      <small class="viewer-help">Completion uses the latest saved reply, not older messages. Refresh tickets with the scanner to update status. Background visits may mark threads read.</small>
       <small role="status" id="scanStatus" aria-live="polite"></small>
       <details id="closedInbox"><summary>Closure notices</summary><div id="receipts" style="max-height:34vh;overflow:auto;padding:0 14px"></div></details>
       <small role="status" id="msg"></small><div id="list"></div>
@@ -314,21 +362,22 @@
   function button(label, action) {
     const b = element('button',label); b.onclick = action; return b;
   }
-  let lastView = '', filter = 'Active';
+  let lastView = '', filter = 'All';
   const expanded = new Map();
-  const matchesFilter = (t, f, now) => {
-    if (f === 'All') return true;
-    if (f === 'Likely complete') return Boolean(t.signal || t.status === 'Resolved');
-    if (f === 'Active') return !t.signal && t.status !== 'Resolved';
-    if (f === 'Due soon') return Boolean(stage(t,now));
-    return t.status === f;
+  const matchesFilter=(t,f,now)=>{
+    if(f==='All')return true;
+    if(f==='Active')return !t.complete;
+    if(f==='Follow-up due')return Boolean(stage(t,now));
+    if(f==='Likely complete')return t.complete;
+    if(f==='Close task')return t.complete && t.status!=='Resolved';
+    return false;
   };
-  for (const label of ['Active','Due soon','Likely complete','All']) {
-    const tab = button(label,()=>{filter=label;render();});
-    tab.dataset.filter = label;
-    const count = element('span',''); count.className='count'; tab.append(count);
-    $('.filters').append(tab);
+  for(const label of ['All','Active','Follow-up due','Likely complete','Close task']){
+    const tab=button(label,()=>{filter=label;lastView='';render();});
+    tab.dataset.filter=label;const count=element('span','');count.className='count';
+    tab.append(count);$('.filters').append(tab);
   }
+  for(const name of TYPE_OPTIONS){const opt=element('option',name);opt.value=name;$('#typeFilter').append(opt);}
   function catchClosures() {
     const dm = /^\/channels\/@me\/(\d+)(?:\/|$)/.exec(location.pathname);
     if (!dm || !document.querySelector('[data-list-id="chat-messages"][aria-label="Messages in Tickety"], main[aria-label="Tickety (Direct Message)" i], [aria-label^="Tickety (direct message)" i][href="/channels/@me/'+dm[1]+'"]')) return;

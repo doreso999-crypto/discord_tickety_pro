@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         Discord Tickety Pro
 // @namespace    doreso999-crypto/discord_tickety_pro
-// @version      1.1.0
+// @version      1.1.1
 // @description  Group visible Tickety tickets by opener and remind staff to follow up.
 // @match        https://discord.com/*
 // @run-at       document-idle
@@ -94,32 +94,53 @@
   const msg = s => { $('#msg').textContent = s; };
   const element = (tag, label) => Object.assign(document.createElement(tag), {textContent:label});
   let context = '', boardGuild = '', seen = new WeakMap();
+  function threadTitle(main) {
+    const label = main?.getAttribute('aria-label') || '';
+    return label.match(/^(.+) \(thread\)$/i)?.[1].trim() || '';
+  }
+  function currentTicket(channel) {
+    for (const main of document.querySelectorAll('main[aria-label]')) {
+      const row = main.querySelector('[id^="chat-messages-' + channel + '-"]');
+      if (row && threadTitle(main)) return {id:channel, name:threadTitle(main)};
+    }
+    const label = document.title.split('|')[0].trim();
+    return {id:channel, name:label && !/^(?:\(\d+\)\s*)?Discord$/i.test(label) ? label : 'Ticket ' + channel};
+  }
   function scan(guild, channel) {
-    const isLog = read('log.' + guild) === channel;
     for (const node of document.querySelectorAll('[id^="chat-messages-"]')) {
-      // Discord can briefly leave the previous channel mounted during navigation.
-      if (!node.id.startsWith('chat-messages-' + channel + '-')) continue;
-      const body = node.innerText || '';
-      if (seen.get(node) === body) continue;
-      seen.set(node, body);
-      const author = node.querySelector('[id^="message-username-"],[class*="username_"]');
+      const row = /^chat-messages-(\d{15,20})-\d{15,20}$/.exec(node.id);
+      if (!row) continue;
+      const source = row[1];
+      const main = node.closest('main[aria-label]');
+      const title = threadTitle(main);
+      if (source !== channel && !title) continue;
+      const author = node.querySelector('[id^="message-username-"] [data-text], [id^="message-username-"] [class*="username_"]')
+        || node.querySelector('[id^="message-username-"]');
       if (author?.textContent.trim().toLowerCase() !== 'tickety') continue;
-      const owner = opener(body);
+      const body = node.innerText || '';
+      const signature = title + '\n' + body;
+      if (seen.get(node) === signature) continue;
+      seen.set(node,signature);
+      const embed = [...node.querySelectorAll('[id^="message-accessories-"] article')]
+        .find(el => /^ticket created$/i.test(el.querySelector('[class*="embedTitle"]')?.textContent.trim() || ''));
+      const description = embed?.querySelector('[class*="embedDescription"]')?.textContent.trim() || '';
+      const thanked = /^thanks\s+@?([^\n]{1,80}?)\s+for creating a (?:task|ticket)\b/i.exec(description);
+      const owner = thanked?.[1].trim() || opener(body);
       if (!owner && !/ticket (?:created|opened)|your ticket has been created/i.test(body)) continue;
-      let id = channel, name = document.title.split('|')[0].trim();
-      const targets = new Map();
-      {
+      let id = source, name = title;
+      if (!(title && thanked)) {
+        const targets = new Map();
         for (const a of node.querySelectorAll('a[href]')) {
           const m = route(a.pathname);
-          if (a.origin === location.origin && m?.[1] === guild && m[2] !== channel) targets.set(m[2], a.textContent.trim());
+          if (a.origin === location.origin && m?.[1] === guild && m[2] !== source) targets.set(m[2], a.textContent.trim());
         }
+        if (read('log.' + guild) === source || targets.size) {
+          if (targets.size !== 1) continue;
+          [id,name] = targets.entries().next().value;
+        } else if (!owner) continue;
       }
-      if (isLog || targets.size) {
-        if (targets.size !== 1) continue;
-        [id, name] = targets.entries().next().value;
-      } else if (!owner) continue;
       const old = read(keyFor(guild,id));
-      if (!old || (!old.owner && owner)) save(guild,id,{name: name || 'Ticket ' + id, owner});
+      save(guild,id,{owner:old?.owner || owner, name:name || old?.name || (id === channel ? currentTicket(channel).name : 'Ticket ' + id)});
     }
   }
   let editing = null;
@@ -283,7 +304,7 @@
   $('#add').onclick=()=>{
     const m=route(location.pathname); if(!m)return;
     const old=read(keyFor(m[1],m[2]));
-    editTicket(old || {guild:m[1],id:m[2],name:document.title.split('|')[0].trim() || 'Ticket '+m[2],
+    editTicket(old || {guild:m[1],id:m[2],name:currentTicket(m[2]).name,
       owner:'',due:created(m[2])+168*HOUR});
   };
   $('#log').onclick=()=>{

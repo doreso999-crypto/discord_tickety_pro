@@ -316,7 +316,13 @@
       const ticket = read(keyFor(guild,thread));
       if (!ticket) continue;
       const key = historyKey(guild,thread);
-      if (!watchSince.has(key)) watchSince.set(key,Date.now());
+      if (!watchSince.has(key)) {
+        const job=isScanWorker ? read(scanJobKey(guild)) : null;
+        const previouslyChecked=job?.checkedAt?.[thread];
+        // When the worker revisits a previously scanned thread, a reply
+        // received before the worker opened it still counts as new.
+        watchSince.set(key,Number.isFinite(previouslyChecked)?previouslyChecked-1000:Date.now());
+      }
       const signature = node.id + '\n' + node.textContent;
       if (observedRows.get(node) === signature) continue;
       const reply = readReply(node,id);
@@ -707,7 +713,7 @@
   }
 
   function maybeStartSessionScan(guild) {
-    if (isScanWorker || !navigator.onLine || document.visibilityState!=='visible') return;
+    if (isScanWorker || !navigator.onLine) return;
     const discovered=discoverThreads();
     if (!discovered.length) return;
     watchSidebarState(guild,discovered);
@@ -955,6 +961,13 @@
       if(context!==m[0]) { context=m[0]; seen=new WeakMap(); watchSince.clear(); msg(''); }
       if(boardGuild!==m[1]) {boardGuild=m[1];lastView='';}
       scan(m[1],m[2]); captureReplies(m[1],m[2]);
+      const known=read(keyFor(m[1],m[2]));
+      if(known) {
+        const currentMain=[...document.querySelectorAll('main[aria-label]')].find(
+          el=>threadTitle(el) && el.querySelector('[id^="chat-messages-'+m[2]+'-"]'));
+        const title=threadTitle(currentMain);
+        if(title && title!==known.name)save(m[1],m[2],{name:title});
+      }
       if (!isScanWorker) maybeStartSessionScan(m[1]);
     }
     if (!isScanWorker) render();
@@ -1003,8 +1016,27 @@
   $('#scanPriority').onclick=()=>{
     const m=route(location.pathname);if(!m)return;
     const active=read(scanJobKey(m[1]));
-    if(active?.status==='running') {
-      msg('A scan is already running. Pause it first if you want a new red-ticket scan.');
+    if(active && ['running','monitoring'].includes(active.status)) {
+      const marked=discoverThreads().filter(t=>t.priority===2);
+      let queued=0,newTickets=0;
+      const additions=[];
+      for(const t of marked) {
+        if(active.results?.[t.id]) {
+          if(queueLiveChange(m[1],t.id))queued++;
+        } else if(!(active.queue||[]).some(x=>x.id===t.id)) {
+          additions.push(t);
+        }
+      }
+      if(additions.length) {
+        const current=read(scanJobKey(m[1]));
+        current.queue.push(...additions);
+        current.status='running';
+        current.updated=Date.now();
+        write(scanJobKey(m[1]),current);
+        newTickets=additions.length;
+      }
+      msg('Queued '+queued+' known tickets for immediate checks and '+newTickets+' new threads.');
+      lastView='';render();
       return;
     }
     const marked=discoverThreads().filter(t=>t.priority===2);
@@ -1029,10 +1061,10 @@
   $('#scanToggle').onclick=()=>{
     const m=route(location.pathname);if(!m)return;
     const key=scanJobKey(m[1]), job=read(key);if(!job)return;
-    if(job.status==='running') {
+    if(['running','monitoring'].includes(job.status)) {
       job.status='paused';job.updated=Date.now();write(key,job);
-      msg('Scan paused. The scanner will finish its current ticket before stopping.');
-    } else if(['paused','ready','interrupted'].includes(job.status)) {
+      msg('Monitoring paused. The worker will stop after its current check.');
+    } else if(['paused','ready','interrupted','complete'].includes(job.status)) {
       job.status='ready';job.error='';write(key,job);
       launchScan(m[1],true);
     }
@@ -1078,6 +1110,32 @@
     if(e.key.startsWith(PREFIX+'log.'))seen=new WeakMap();
     render();
   });
+  // Capture new or edited messages as Discord renders them, rather than
+  // waiting for the four-second fallback tick. Ignore the shadow-root
+  // dashboard, which is not part of the Discord message DOM.
+  let liveUpdateTimer=null;
+  const liveObserver=new MutationObserver(changes=>{
+    let relevant=false;
+    for(const change of changes){
+      const el=change.target.nodeType===1?change.target:change.target.parentElement;
+      if(!el || !el.closest)continue;
+      if(el.closest('main[aria-label], [data-list-item-id^="channels___"]')){
+        relevant=true;break;
+      }
+      for(const node of change.addedNodes){
+        if(node.nodeType!==1)continue;
+        if(node.matches?.('main[aria-label], [data-list-item-id^="channels___"]')
+          ||node.querySelector?.('li[id^="chat-messages-"], [data-list-item-id^="channels___"]')){
+          relevant=true;break;
+        }
+      }
+      if(relevant)break;
+    }
+    if(!relevant||liveUpdateTimer!==null)return;
+    liveUpdateTimer=setTimeout(()=>{liveUpdateTimer=null;tick();},220);
+  });
+  liveObserver.observe(document.getElementById('app-mount')||document.body,
+    {subtree:true,childList:true,characterData:true,attributes:true,attributeFilter:['aria-label']});
   window.addEventListener('focus',()=>{tick();checkReminders();});
   window.addEventListener('online',()=>{tick();if(isScanWorker)runScanWorker();});
   setInterval(tick,4000);setInterval(checkReminders,60000);

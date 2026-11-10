@@ -1,8 +1,8 @@
 // ==UserScript==
 // @name         Discord Tickety Pro
 // @namespace    doreso999-crypto/discord_tickety_pro
-// @version      1.5.0
-// @description  Group Tickety tickets, scan sidebar threads once per session, and remind staff to follow up.
+// @version      1.6.0
+// @description  Session ticket scans and continuous monitoring, user/type filters, five-day follow-ups.
 // @match        https://discord.com/*
 // @run-at       document-idle
 // @updateURL    https://raw.githubusercontent.com/doreso999-crypto/discord_tickety_pro/main/discord_tickety_pro.user.js
@@ -15,7 +15,7 @@
 
 (() => {
   'use strict';
-  const VERSION = '1.5.0'; // Report loaded GitHub code, not the outer Tampermonkey loader version.
+  const VERSION = '1.6.0'; // Report loaded GitHub code, not the outer Tampermonkey loader version.
   const HOUR = 3600000;
   const PREFIX = 'ticketyPro.1.';
   const route = path => /^\/channels\/(\d{15,20})\/(\d{15,20})(?:\/|$)/.exec(path);
@@ -189,9 +189,9 @@
       @media(max-width:680px){.bar{grid-template-columns:1fr}.more-filters{grid-template-columns:repeat(2,minmax(0,1fr))}}
       @media(max-width:370px){.more-filters{grid-template-columns:1fr}#board{width:calc(100vw - 12px);right:6px}}
     </style>
-    <button id="launch" aria-expanded="false" aria-controls="board" hidden>Ticket board v1.5.0</button>
+    <button id="launch" aria-expanded="false" aria-controls="board" hidden>Ticket board v1.6.0</button>
     <section id="board" hidden aria-label="Tickety ticket board">
-      <header><h2>Ticket board</h2><span id="version" title="Installed userscript version">v1.5.0</span><a id="detach" target="_blank" rel="noopener">Open in tab ↗</a><button id="close" aria-label="Close ticket board">×</button></header>
+      <header><h2>Ticket board</h2><span id="version" title="Installed userscript version">v1.6.0</span><a id="detach" target="_blank" rel="noopener">Open in tab ↗</a><button id="close" aria-label="Close ticket board">×</button></header>
       <div class="bar">
         <input id="search" type="search" autocomplete="off" aria-label="Search ticket name or user" placeholder="Search ticket, user, ID or category...">
         <select id="sort" aria-label="Sort tickets">
@@ -211,7 +211,7 @@
       </div>
       <div class="filters" role="group" aria-label="Status filter"></div>
       <small id="resultCount" aria-live="polite"></small>
-      <small class="viewer-help">Completion uses the latest saved reply, not older messages. Refresh tickets with the scanner to update status. Background visits may mark threads read.</small>
+      <small class="viewer-help">Visible threads update immediately; scanned threads are checked throughout the session. Background visits can mark threads read.</small>
       <small role="status" id="scanStatus" aria-live="polite"></small>
       <details id="closedInbox"><summary>Closure notices</summary><div id="receipts" style="max-height:34vh;overflow:auto;padding:0 14px"></div></details>
       <small role="status" id="msg"></small><div id="list"></div>
@@ -591,6 +591,10 @@
   const SCAN_IDLE_MS = 30 * 60 * 1000;
   const SCAN_STALE_MS = 2 * 60 * 1000;
   const SCAN_LOAD_MS = 16000;
+  const LIVE_RECHECK_MS = 90000;
+  const LIVE_TAIL_MS = 6500;
+  const LIVE_IDLE_MS = 1800;
+  const sidebarState = new Map();
   const scanJobKey = guild => 'scanner.job.' + guild;
   const delay = ms => new Promise(resolve => setTimeout(resolve, ms));
   const scanId = () => Date.now().toString(36) + '-' + Math.random().toString(36).slice(2, 10);
@@ -645,7 +649,8 @@
   }
 
   function makeScanJob(guild,session,queue) {
-    return {guild,session,id:scanId(),queue:prioritizeScanQueue(queue),index:0,results:{},attempts:{},status:'ready',
+    return {guild,session,id:scanId(),queue:prioritizeScanQueue(queue),index:0,results:{},attempts:{},
+      pending:[],checkedAt:{},liveChecks:0,status:'ready',
       heartbeat:0,started:Date.now(),updated:Date.now(),error:''};
   }
 
@@ -655,19 +660,38 @@
     for (const thread of threads) if (!known.has(thread.id)) {
       job.queue.push(thread); known.add(thread.id); added++;
     }
-    if (added && job.status==='complete') job.status='ready';
+    if (added && ['complete','monitoring'].includes(job.status)) job.status=job.status==='monitoring'?'running':'ready';
     return added;
   }
 
+  function queueLiveChange(guild,id) {
+    const key=scanJobKey(guild),job=read(key);
+    if(!job || !['running','monitoring'].includes(job.status) || !job.results?.[id])return false;
+    job.pending ||= [];
+    if(job.pending.includes(id))return false;
+    job.pending.push(id);job.updated=Date.now();write(key,job);
+    return true;
+  }
+  function watchSidebarState(guild,discovered) {
+    for(const thread of discovered){
+      const key=guild+'/'+thread.id,old=sidebarState.get(key);
+      const current={priority:thread.priority||0,mentions:thread.mentionCount||0};
+      sidebarState.set(key,current);
+      if(old&&(current.mentions>old.mentions||current.priority>old.priority))
+        queueLiveChange(guild,thread.id);
+    }
+  }
   function launchScan(guild,userGesture=false) {
     const key=scanJobKey(guild);
     let job=read(key);
-    if (!job || !job.queue.length || job.index>=job.queue.length || !navigator.onLine) return false;
+    if (!job || !job.queue.length || !navigator.onLine) return false;
     if (job.status==='paused') return false;
-    if (job.status==='running' && Date.now()-job.heartbeat < SCAN_STALE_MS) return true;
-    job={...job,status:'running',heartbeat:Date.now(),updated:Date.now(),error:''};
+    if (['running','monitoring'].includes(job.status) && Date.now()-job.heartbeat < SCAN_STALE_MS) return true;
+    job={...job,status:job.index>=job.queue.length?'monitoring':'running',
+      heartbeat:Date.now(),updated:Date.now(),error:''};
     write(key,job);
-    const target=location.origin+'/channels/'+guild+'/'+job.queue[job.index].id+SCAN_HASH+job.id;
+    const first=job.queue[job.index]||job.queue[0];
+    const target=location.origin+'/channels/'+guild+'/'+first.id+SCAN_HASH+job.id;
     try {
       if (typeof GM_openInTab==='function') {
         const tab=GM_openInTab(target,{active:false,insert:true,setParent:true});
@@ -686,6 +710,7 @@
     if (isScanWorker || !navigator.onLine || document.visibilityState!=='visible') return;
     const discovered=discoverThreads();
     if (!discovered.length) return;
+    watchSidebarState(guild,discovered);
     const session=browserSession();
     const key=scanJobKey(guild);
     let job=read(key);
@@ -701,7 +726,10 @@
       write(key,job);
       if (job.status==='ready' && !job.error) launchScan(guild);
     }
-    if (job.status==='running' && Date.now()-job.heartbeat > SCAN_STALE_MS) {
+    if(job.status==='complete' && job.queue.length){
+      job.status='ready';job.error='';write(key,job);launchScan(guild);return;
+    }
+    if(['running','monitoring'].includes(job.status) && Date.now()-job.heartbeat > SCAN_STALE_MS) {
       job.status='interrupted';
       job.error='Scanning tab stopped responding. Press Resume scan.';
       write(key,job);
@@ -718,15 +746,15 @@
     const uncertain=resultSet.filter(v=>v!=='collected').length;
     const red=job?.queue.filter(t=>t.priority===2).length || 0;
     const state=job?.status || 'waiting';
-    const caption={ready:'Ready',running:'Scanning',paused:'Paused',complete:'Finished',
+    const caption={ready:'Ready',running:'Scanning',monitoring:'Live monitoring',paused:'Paused',complete:'Finished',
       interrupted:'Interrupted',waiting:'Waiting for threads'}[state] || state;
-    status.textContent='Session scan: '+caption+' · '+complete+'/'+total+' visits · '+verified+' verified'
+    status.textContent='Session scan: '+caption+' · '+complete+'/'+total+' visits · '+verified+' verified' + (job?.liveChecks?' · '+job.liveChecks+' live checks':'')
       +(red ? ' · red priority' : '')
       +(uncertain ? ' · '+uncertain+' incomplete' : '')
       +(job?.error ? ' · '+job.error : '')
       +(total ? ' · only verified Tickety tickets are listed' : '');
-    action.textContent=state==='running' ? 'Pause scan' : 'Resume scan';
-    action.disabled=!job || state==='complete' || (state==='waiting') || !total;
+    action.textContent=['running','monitoring'].includes(state)?'Pause monitoring':'Resume monitoring';
+    action.disabled=!job || state==='waiting' || !total;
     now.disabled=state==='running';
     return job;
   }

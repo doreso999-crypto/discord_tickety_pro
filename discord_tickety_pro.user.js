@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         Discord Tickety Pro
 // @namespace    doreso999-crypto/discord_tickety_pro
-// @version      1.4.1
+// @version      1.4.2
 // @description  Group Tickety tickets, scan sidebar threads once per session, and remind staff to follow up.
 // @match        https://discord.com/*
 // @run-at       document-idle
@@ -15,7 +15,7 @@
 
 (() => {
   'use strict';
-  const VERSION = typeof GM_info !== 'undefined' && GM_info?.script?.version || '1.4.1';
+  const VERSION = typeof GM_info !== 'undefined' && GM_info?.script?.version || '1.4.2';
   const HOUR = 3600000;
   const PREFIX = 'ticketyPro.1.';
   const route = path => /^\/channels\/(\d{15,20})\/(\d{15,20})(?:\/|$)/.exec(path);
@@ -132,9 +132,9 @@
       :host([data-full]) #board{inset:0;width:100vw;height:100dvh;max-height:none;max-width:none;border-radius:0;box-shadow:none;padding-inline:max(8px,calc((100vw - 1060px)/2));z-index:2147483647}
       :host([data-full]) #list{flex:1}:host([data-full]) #detach,:host([data-full]) #close{display:none}
     </style>
-    <button id="launch" aria-expanded="false" aria-controls="board" hidden>Ticket board v1.4.1</button>
+    <button id="launch" aria-expanded="false" aria-controls="board" hidden>Ticket board v1.4.2</button>
     <section id="board" hidden aria-label="Tickety ticket board">
-      <header><h2>Ticket board</h2><span id="version" title="Installed userscript version">v1.4.1</span><a id="detach" target="_blank" rel="noopener">Open in tab ↗</a><button id="close" aria-label="Close ticket board">×</button></header>
+      <header><h2>Ticket board</h2><span id="version" title="Installed userscript version">v1.4.2</span><a id="detach" target="_blank" rel="noopener">Open in tab ↗</a><button id="close" aria-label="Close ticket board">×</button></header>
       <div class="bar"><input id="search" type="search" aria-label="Search opener or ticket" placeholder="Search opener or ticket"><select id="sort" aria-label="Sort tickets within each opener"><option value="due">Expiring first</option><option value="age">Oldest ticket first</option><option value="latest">Latest activity first</option></select></div>
       <div class="filters" role="group" aria-label="Filter tickets"></div>
       <small class="viewer-help">Session scanner checks visible sidebar threads in one background tab. Only Tickety-confirmed tickets appear below. Scanning may mark threads as read.</small>
@@ -205,11 +205,21 @@
   const watchSince = new Map();
   function readReply(node, id) {
     const content = node.querySelector('[id="message-content-' + id + '"]');
-    const timestamp = node.querySelector('[id="message-timestamp-' + id + '"]');
+    const timestamp = node.querySelector('[id="message-timestamp-' + id + '"],time[datetime]');
     if (!content || !timestamp) return null;
     const article = node.querySelector('[aria-labelledby*="message-username-"]');
-    const reference = article?.getAttribute('aria-labelledby').match(/\bmessage-username-\d+\b/);
-    const header = reference && document.getElementById(reference[0]);
+    const reference = (article?.getAttribute('aria-labelledby') || '').match(/\bmessage-username-\d+\b/);
+    let header = reference && document.getElementById(reference[0]);
+    if (!header) header = node.querySelector('[id^="message-username-"]');
+    // Discord omits repeated names for consecutive messages by one sender.
+    if (!header) {
+      let previous = node.previousElementSibling;
+      for (let i=0; previous && i<20; i++, previous=previous.previousElementSibling) {
+        header=previous.querySelector('[id^="message-username-"]');
+        if (header) break;
+        if (!previous.querySelector('[id^="message-content-"]')) break;
+      }
+    }
     if (!header || header.querySelector('[aria-label$="App" i]')) return null;
     const author = (header.querySelector('[data-text]') || header).textContent.trim();
     if (!author || author.toLowerCase() === 'tickety') return null;
@@ -218,7 +228,7 @@
     const text = copy.textContent.trim();
     const attachments = [...node.querySelectorAll('a[data-role="img"],a[class*="attachmentName"]')]
       .map(a=>a.textContent.trim() || 'Image attachment');
-    const time = Date.parse(timestamp.dateTime);
+    const time = Date.parse(timestamp.dateTime || timestamp.getAttribute('datetime') || '');
     if (!Number.isFinite(time) || (!text && !attachments.length)) return null;
     return {id,author,time,text:[text,...attachments].filter(Boolean).join('\n')};
   }
@@ -576,29 +586,70 @@
     return null;
   }
 
+  function getThreadScroller(main) {
+    const messages=main.querySelector('ol[data-list-id="chat-messages"]');
+    if (!messages) return null;
+    return messages.closest('[role="group"][class*="scroller_"]')
+      || [...main.querySelectorAll('[class*="scroller_"]')].find(el=>el.contains(messages) && el.scrollHeight>el.clientHeight)
+      || null;
+  }
+
+  function threadMessageEdge(main,id) {
+    const messages=main.querySelectorAll('li[id^="chat-messages-' + id + '-"]');
+    return messages.length ? [messages[0].id,messages[messages.length-1].id,messages.length].join('|') : '';
+  }
+
+  function captureThreadSlice(guild,id) {
+    scan(guild,id);
+    captureReplies(guild,id);
+  }
+
+  async function sweepThread(guild,id,main,scroller,direction,limitMs) {
+    const until=Date.now()+limitMs;
+    let stable=0, previous='';
+    const forward=direction==='down';
+    while (Date.now()<until && navigator.onLine) {
+      const m=route(location.pathname);
+      if (!m || m[1]!==guild || m[2]!==id) return false;
+      captureThreadSlice(guild,id);
+      const height=Math.max(1,scroller.clientHeight);
+      const max=Math.max(0,scroller.scrollHeight-height);
+      const step=Math.max(350,Math.round(height*.78));
+      const goal=forward?Math.min(max,scroller.scrollTop+step):Math.max(0,scroller.scrollTop-step);
+      // Move across real Discord message history, not merely once to the
+      // current scrollHeight. Discord may append/prepend more after each move.
+      scroller.scrollTop=goal;
+      await delay(450);
+      captureThreadSlice(guild,id);
+      const afterMax=Math.max(0,scroller.scrollHeight-scroller.clientHeight);
+      const atEdge=forward ? scroller.scrollTop>=afterMax-12 : scroller.scrollTop<=12;
+      const signature=threadMessageEdge(main,id)+'|'+Math.round(scroller.scrollHeight)+'|'+Math.round(scroller.scrollTop);
+      stable=atEdge && signature===previous ? stable+1 : 0;
+      previous=signature;
+      // Multiple settled checks are required for a Discord lazy-load to end.
+      if (stable>=2) return true;
+    }
+    captureThreadSlice(guild,id);
+    return false;
+  }
+
   async function visitThread(guild,item) {
     const main=await waitForThread(item.id);
     if (!main) return 'unverified';
-    const scroller=main.querySelector('[class*="scroller_"][role="group"]');
-    const until=Date.now()+9000;
-    // Visit the beginning to find Tickety's creator embed, including when
-    // Discord initially displays only the newest part of a long thread.
-    do {
-      scan(guild,item.id);
-      captureReplies(guild,item.id);
-      if (read(keyFor(guild,item.id))?.owner) break;
-      if (scroller) scroller.scrollTop=0;
-      await delay(550);
-    } while (Date.now()<until && navigator.onLine);
-    // Return to recent messages to collect the latest available replies.
-    if (scroller) {
-      scroller.scrollTop=scroller.scrollHeight;
-      await delay(650);
-    }
-    scan(guild,item.id);
-    captureReplies(guild,item.id);
-    await delay(350); // permit queued navigator.locks writes to finish
-    return read(keyFor(guild,item.id))?.owner ? 'collected' : 'unverified';
+    const scroller=getThreadScroller(main);
+    if (!scroller) return 'unverified';
+    captureThreadSlice(guild,item.id);
+    // First reveal the ticket-creation embed, even when Discord initially
+    // opens midway through a thread instead of at its earliest message.
+    const beginning=await sweepThread(guild,item.id,main,scroller,'up',9000);
+    // Traverse forward in viewport-sized steps; collect messages at each
+    // step and wait for the newest messages to actually finish loading.
+    const latest=await sweepThread(guild,item.id,main,scroller,'down',16000);
+    captureThreadSlice(guild,item.id);
+    await delay(450); // finish pending navigator.locks writes
+    const owner=read(keyFor(guild,item.id))?.owner;
+    return owner && beginning && latest ? 'collected'
+      : owner ? 'partial' : 'unverified';
   }
 
   async function openWorkerRoute(guild,id) {

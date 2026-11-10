@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         Discord Tickety Pro
 // @namespace    doreso999-crypto/discord_tickety_pro
-// @version      1.2.0
+// @version      1.3.0
 // @description  Group visible Tickety tickets by opener and remind staff to follow up.
 // @match        https://discord.com/*
 // @run-at       document-idle
@@ -18,9 +18,40 @@
   const keyFor = (guild, id) => 'ticket.' + guild + '.' + id;
   const created = id => Number(BigInt(id) >> 22n) + 1420070400000;
   
+  const standalone = location.hash === '#tickety-board';
+  const summaries = new Map();
+  function isCompletion(text) {
+    const sentence = text.toLowerCase().replace(/<@!?\d+>/g,'').trim();
+    if (/\?|\b(?:not|never|don't|didn't|cannot|can't|pending|waiting|need|any|will|before|please update|can you|could you|when|if|should|haven't|hasn't)\b/i.test(sentence)) return false;
+    return /\b(?:reactivated|updated|please close (?:the |this )?ticket)\b/.test(sentence)
+      || /^(?:update|close)(?:[.!✅\s]+|$)$/.test(sentence);
+  }
+  function inspectTicket(t) {
+    const key = historyKey(t.guild,t.id);
+    const identity = JSON.stringify([t.owner,t.ownerAlias]);
+    let summary = summaries.get(key);
+    if (!summary || summary.identity !== identity) {
+      const opened = created(t.id);
+      const owners = [t.owner,t.ownerAlias].filter(Boolean).map(s=>s.trim().replace(/^@/,'').toLowerCase());
+      let latest = opened, signal = null;
+      for (const m of Object.values(read(key) || {})) {
+        latest = Math.max(latest,m.time);
+        if (owners.length && !owners.includes(m.author.trim().replace(/^@/,'').toLowerCase()) &&
+            isCompletion(m.text) && (!signal || m.time > signal.time)) signal = m;
+      }
+      const deadline = new Date(latest);
+      deadline.setDate(deadline.getDate()+6);
+      summary = {identity,opened,latest,signal,due:deadline.getTime()}; summaries.set(key,summary);
+    }
+    return {...t,...summary};
+  }
+  function ageDays(opened,now) {
+    const day = n=>{const d=new Date(n);return Date.UTC(d.getFullYear(),d.getMonth(),d.getDate());};
+    return Math.max(0,(day(now)-day(opened))/86400000);
+  }
   function rows(guild) {
     return Object.keys(localStorage).filter(k => k.startsWith(PREFIX + 'ticket.' + guild + '.'))
-      .map(k => JSON.parse(localStorage.getItem(k))).filter(Boolean);
+      .map(k => JSON.parse(localStorage.getItem(k))).filter(Boolean).map(inspectTicket);
   }
   function save(guild, id, fields) {
     const key = keyFor(guild, id);
@@ -77,11 +108,18 @@
       @media(max-width:480px){#launch,#board{right:8px}#board{width:calc(100vw - 16px)}header,.bar,.filters,#editor,footer{padding-left:10px;padding-right:10px}.topline{flex-wrap:wrap}.topline a{min-width:45%}}
       @media(max-height:520px){#board{top:6px;bottom:6px;max-height:none}#editor{overflow:auto;max-height:40dvh}}
       .viewer-help{padding:8px 18px}.history{white-space:pre-wrap;overflow-wrap:anywhere}.history p{margin:6px 0 12px}.history summary{font-size:12px}
+      #launch{background:#ffd343;color:#201903;border:2px solid #33290b;border-radius:22px;padding:9px 15px;touch-action:none;user-select:none;cursor:grab}
+      #launch:active{cursor:grabbing}#board{border-top:4px solid #ffd343;background:#152029}
+      #detach,article>a{color:#a5e9f3;font-weight:650;text-underline-offset:3px}
+      #detach{font-size:13px}summary{background:#24343d}.filters button[aria-pressed=true]{background:#ffda62;color:#211b0b;border-color:#ffda62}.filters button[aria-pressed=true] .count{color:#433514}
+      .evidence{color:#9be2bb;padding:4px 0}.history>div{padding:0 12px}
+      :host([data-full]) #board{inset:0;width:100vw;height:100dvh;max-height:none;max-width:none;border-radius:0;box-shadow:none;padding-inline:max(8px,calc((100vw - 1060px)/2));z-index:2147483647}
+      :host([data-full]) #list{flex:1}:host([data-full]) #detach,:host([data-full]) #close{display:none}
     </style>
     <button id="launch" aria-expanded="false" aria-controls="board" hidden>Ticket board</button>
     <section id="board" hidden aria-label="Tickety ticket board">
-      <header><h2>Ticket board</h2><button id="close" aria-label="Close ticket board">×</button></header>
-      <div class="bar"><input id="search" type="search" aria-label="Search opener or ticket" placeholder="Search opener or ticket"></div>
+      <header><h2>Ticket board</h2><a id="detach" target="_blank" rel="noopener">Open in tab ↗</a><button id="close" aria-label="Close ticket board">×</button></header>
+      <div class="bar"><input id="search" type="search" aria-label="Search opener or ticket" placeholder="Search opener or ticket"><select id="sort" aria-label="Sort tickets within each opener"><option value="due">Expiring first</option><option value="age">Oldest ticket first</option><option value="latest">Latest activity first</option></select></div>
       <div class="filters" role="group" aria-label="Filter tickets"></div>
       <small class="viewer-help">Open a ticket to collect its visible messages. Keep it open in a separate tab for reply alerts while you work elsewhere.</small>
       <small role="status" id="msg"></small><div id="list"></div>
@@ -137,7 +175,9 @@
         } else if (!owner) continue;
       }
       const old = read(keyFor(guild,id));
-      save(guild,id,{owner:old?.owner || owner, name:name || old?.name || (id === channel ? currentTicket(channel).name : 'Ticket ' + id)});
+      const mentions = thanked && node.querySelectorAll('[id^="message-content-"] [aria-label="Spoiler"] .mention');
+      const ownerAlias = mentions?.length === 1 ? mentions[0].textContent.trim().replace(/^@/,'') : old?.ownerAlias;
+      save(guild,id,{ownerAlias,owner:old?.owner || owner, name:name || old?.name || (id === channel ? currentTicket(channel).name : 'Ticket ' + id)});
     }
   }
   const historyKey = (guild,id) => 'messages.' + guild + '.' + id;
@@ -193,7 +233,7 @@
             history[reply.id] = reply; changed = true;
           }
         }
-        if (changed) write(key,history);
+        if (changed) {write(key,history); summaries.delete(key);}
         items.forEach(({node,signature})=>observedRows.set(node,signature));
         if (changed) refreshHistory(key);
         if (fresh.length && read('alerts')) {
@@ -223,11 +263,12 @@
   const expanded = new Map();
   const matchesFilter = (t, f, now) => {
     if (f === 'All') return true;
-    if (f === 'Active') return t.status !== 'Resolved';
+    if (f === 'Likely complete') return Boolean(t.signal || t.status === 'Resolved');
+    if (f === 'Active') return !t.signal && t.status !== 'Resolved';
     if (f === 'Due soon') return Boolean(stage(t,now));
     return t.status === f;
   };
-  for (const label of ['Active','Due soon','All']) {
+  for (const label of ['Active','Due soon','Likely complete','All']) {
     const tab = button(label,()=>{filter=label;render();});
     tab.dataset.filter = label;
     const count = element('span',''); count.className='count'; tab.append(count);
@@ -235,10 +276,12 @@
   }
   function render() {
     const m = route(location.pathname);
-    $('#launch').hidden = !m;
+    $('#launch').hidden = !m || standalone;
     if (!m) { $('#board').hidden = true; $('#launch').setAttribute('aria-expanded','false'); return; }
     const [,guild,channel] = m;
-    const all = rows(guild).sort((a,b) => a.due-b.due);
+    $('#detach').href = '/channels/'+guild+'/'+channel+'#tickety-board';
+    const sort = $('#sort').value;
+    const all = rows(guild).sort((a,b) => sort === 'age' ? a.opened-b.opened : sort === 'latest' ? b.latest-a.latest : a.due-b.due);
     const now = Date.now(), due = all.filter(t => stage(t,now)).length;
     $('#launch').textContent = 'Ticket board · ' + all.length + (due ? ' · ' + due + ' due' : '');
     if ($('section').hidden) return;
@@ -252,7 +295,7 @@
     const q = $('#search').value.trim().toLowerCase();
     const shown = all.filter(t => (t.owner+' '+t.name+' '+t.id).toLowerCase().includes(q) &&
       matchesFilter(t,filter,now));
-    const view = JSON.stringify([guild,shown,shown.map(t=>stage(t,now)),filter,q]);
+    const view = JSON.stringify([guild,new Date(now).toDateString(),shown,shown.map(t=>stage(t,now)),filter,q]);
     if (view === lastView) return;
     lastView = view;
     const list = $('#list');
@@ -284,7 +327,7 @@
         const card = document.createElement('article'), link = element('a',t.name);
         link.href = '/channels/'+guild+'/'+t.id;
         const warning = stage(t,now);
-        const date = element('small',(t.exact?'Close time':'7-day estimate') + ' · ' + new Date(t.due).toLocaleString() + (warning?' · '+warning:''));
+        const date = element('small',('Estimated expiry') + ' · ' + new Date(t.due).toLocaleString() + (warning?' · '+warning:''));
         if (warning) date.className='alert';
         link.target='_blank'; link.rel='noopener';
         const key = historyKey(guild,t.id);
@@ -292,7 +335,15 @@
         history.open=openedHistory.has(key);
         history.append(element('summary','Messages'),element('div',''));
         history.ontoggle=()=>{if (!history.isConnected) return; if(history.open){openedHistory.add(key);refreshHistory(key);} else openedHistory.delete(key);};
-        card.append(link,date,history); group.append(card);
+        const age = ageDays(t.opened,now);
+        const activity = element('small','Age · '+age+(age===1?' day':' days')+'   |   Last activity · '+new Date(t.latest).toLocaleString());
+        activity.title='Opened '+new Date(t.opened).toLocaleString();
+        card.append(link,activity,date);
+        if(t.signal) {
+          const evidence = element('small','Likely complete · '+t.signal.author+' · “'+t.signal.text.slice(0,160)+'”');
+          evidence.className='evidence';card.append(evidence);
+        }
+        card.append(history); group.append(card);
       }
       list.append(group);
     }
@@ -302,14 +353,14 @@
     if (!read('alerts')) return;
     const pending = [];
     for (const key of Object.keys(localStorage).filter(k=>k.startsWith(PREFIX+'ticket.'))) {
-      const t = JSON.parse(localStorage.getItem(key)), label = stage(t,Date.now());
-      if (label && t.notified !== label) pending.push({t,label});
+      const t = inspectTicket(JSON.parse(localStorage.getItem(key))), label = stage(t,Date.now());
+      if (label && t.notified !== t.due+'|'+label) pending.push({t,label});
     }
     if (!pending.length) return;
     const first=pending[0].t;
     GM_notification({title:'Tickety follow-up · '+pending.length+' ticket(s)',text:pending.slice(0,3).map(({t,label})=>(t.owner||'Unknown opener')+' · '+t.name+' · '+label).join('\n'),
       onclick:()=>window.open('https://discord.com/channels/'+first.guild+'/'+first.id,'_blank','noopener')});
-    pending.forEach(({t,label})=>save(t.guild,t.id,{notified:label}));
+    pending.forEach(({t,label})=>save(t.guild,t.id,{notified:t.due+'|'+label}));
   }
   function tick() {
     const m = route(location.pathname);
@@ -326,14 +377,46 @@
     if(open) {render(); $('#search').focus();}
     else {$('#launch').focus();}
   }
-  $('#launch').onclick=()=>setBoard($('#board').hidden);
+  const launcher = $('#launch');
+  launcher.title='Open ticket board · drag to move';
+  let drag = null, moved = false;
+  function place(x,y) {
+    launcher.style.left=Math.max(0,Math.min(x,innerWidth-launcher.offsetWidth))+'px';
+    launcher.style.top=Math.max(0,Math.min(y,innerHeight-launcher.offsetHeight))+'px';
+    launcher.style.right='auto';launcher.style.bottom='auto';
+  }
+  function restorePosition() {
+    const pos=read('launcherPosition');
+    if(pos && !launcher.hidden) place(pos.x,pos.y);
+  }
+  launcher.onpointerdown=e=>{
+    if(e.button!==0)return;
+    const rect=launcher.getBoundingClientRect();
+    drag={x:e.clientX,y:e.clientY,left:rect.left,top:rect.top};moved=false;
+    launcher.setPointerCapture(e.pointerId);
+  };
+  launcher.onpointermove=e=>{
+    if(!drag)return;
+    const dx=e.clientX-drag.x,dy=e.clientY-drag.y;
+    if(!moved && Math.hypot(dx,dy)<5)return;
+    moved=true;place(drag.left+dx,drag.top+dy);
+  };
+  launcher.onpointerup=()=>{
+    if(drag && moved)write('launcherPosition',{x:launcher.offsetLeft,y:launcher.offsetTop});
+    drag=null;
+  };
+  launcher.onpointercancel=()=>{drag=null;moved=false;};
+  launcher.onclick=e=>{if(!moved || e.detail===0)setBoard($('#board').hidden);moved=false;};
+  window.addEventListener('resize',restorePosition);
+  if(standalone){host.setAttribute('data-full','');$('#board').hidden=false;}
+  
   $('#close').onclick=()=>setBoard(false);
   root.addEventListener('keydown',e=>{
-    if(e.key==='Escape' && !$('#board').hidden) {
+    if(!standalone && e.key==='Escape' && !$('#board').hidden) {
       e.stopPropagation(); setBoard(false);
     }
   });
-  $('#search').oninput=render;
+  $('#search').oninput=render; $('#sort').onchange=render;
   $('#alerts').onclick=()=>{
     const enabled=!read('alerts');write('alerts',enabled); render();
     msg(enabled?'Reply alerts enabled for open ticket tabs. Deadline alerts run at 24 hours, 6 hours and past due.':'Desktop alerts disabled.');
@@ -350,7 +433,7 @@
     if(navigator.locks) navigator.locks.request(PREFIX+'notify',{ifAvailable:true},lock=>{if(lock)reminders();});
     else reminders();
   }
-  window.addEventListener('storage',e=>{if(e.key?.startsWith(PREFIX)){if(e.key.startsWith(PREFIX+'messages.')) {refreshHistory(e.key.slice(PREFIX.length));return;} if(e.key.startsWith(PREFIX+'log.'))seen=new WeakMap();render();}});
+  window.addEventListener('storage',e=>{if(e.key?.startsWith(PREFIX)){if(e.key.startsWith(PREFIX+'messages.')) {summaries.delete(e.key.slice(PREFIX.length));refreshHistory(e.key.slice(PREFIX.length));render();return;} if(e.key.startsWith(PREFIX+'log.'))seen=new WeakMap();render();}});
   window.addEventListener('focus',()=>{tick();checkReminders();});
-  setInterval(tick,4000);setInterval(checkReminders,60000);tick();checkReminders();
+  setInterval(tick,4000);setInterval(checkReminders,60000);tick();restorePosition();checkReminders();
 })();
